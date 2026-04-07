@@ -1,0 +1,354 @@
+function createWrapReportsForAllRows() {
+  const SPREADSHEET_ID = "17WN0e84Q6dansBrMu_PE1YhF1wmWobN0oIzb22RSR8s";
+  const TEMPLATE_ID = "1lmWSQJbZtMHf4M_m0S0GmJik1ba4ovZJRXwuixO6ktk";
+  const OUTPUT_FOLDER_ID = "1cleKvIbzlBwJDqoJI1lCkrN7hOl00kuD";
+
+  const imageMappings = [
+    { column: "BLS Chart", placeholder: "{{BLS_CHART}}" },
+    { column: "Sales Lift Chart", placeholder: "{{SALES_LIFT_CHART}}" }
+  ];
+
+  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = spreadsheet.getSheets()[0];
+  const folder = DriveApp.getFolderById(OUTPUT_FOLDER_ID);
+
+  ensureLeadingColumns(sheet, ["Quarter", "Season", "Year"]);
+
+  let data = sheet.getDataRange().getDisplayValues();
+  let headers = data[0];
+
+  const deckUrlCol = getOrCreateColumn(sheet, headers, "Deck URL");
+  const generatedAtCol = getOrCreateColumn(sheet, headers, "Generated At");
+
+  data = sheet.getDataRange().getDisplayValues();
+  headers = data[0];
+
+  const quarterCol = headers.indexOf("Quarter") + 1;
+  const seasonCol = headers.indexOf("Season") + 1;
+  const yearCol = headers.indexOf("Year") + 1;
+  const deckUrlColUpdated = headers.indexOf("Deck URL") + 1;
+  const generatedAtColUpdated = headers.indexOf("Generated At") + 1;
+  const campaignNameIndex = headers.indexOf("Campaign Name");
+
+  if (data.length < 2) {
+    Logger.log("No campaign rows found.");
+    return;
+  }
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+
+    if (row.join("").trim() === "") continue;
+
+    const campaignName = campaignNameIndex > -1 ? String(row[campaignNameIndex] || "").trim() : "";
+    if (campaignName === "") {
+      Logger.log("Skipped row " + (r + 1) + " due to missing Campaign Name");
+      continue;
+    }
+
+    const existingDeckUrl = String(row[deckUrlColUpdated - 1] || "").trim();
+    if (existingDeckUrl !== "") {
+      Logger.log("Skipped existing report for row " + (r + 1) + ": " + campaignName);
+      continue;
+    }
+
+    const rowData = {};
+    headers.forEach((header, i) => {
+      rowData[header] = row[i];
+    });
+
+    const reportName = rowData["Report Name"] || ("Wrap Report " + r);
+
+    try {
+      const copy = DriveApp.getFileById(TEMPLATE_ID).makeCopy(
+        reportName + " - Wrap Report",
+        folder
+      );
+
+      const presentation = SlidesApp.openById(copy.getId());
+      const generatedAt = new Date();
+
+      sheet.getRange(r + 1, generatedAtColUpdated).setValue(generatedAt);
+
+      const fiscal = getFiscalAttributes(generatedAt);
+      sheet.getRange(r + 1, quarterCol).setValue(fiscal.quarter);
+      sheet.getRange(r + 1, seasonCol).setValue(fiscal.season);
+      sheet.getRange(r + 1, yearCol).setValue(fiscal.year);
+
+      const deckUrl = presentation.getUrl();
+      sheet.getRange(r + 1, deckUrlColUpdated).setValue(deckUrl);
+
+      SpreadsheetApp.flush();
+
+      const refreshedHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+      const refreshedRow = sheet.getRange(r + 1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+
+      const refreshedRowData = {};
+      refreshedHeaders.forEach((header, i) => {
+        refreshedRowData[header] = refreshedRow[i];
+      });
+
+      refreshedRowData["Insight"] = buildInsight(refreshedRowData);
+
+      Object.keys(refreshedRowData).forEach((key) => {
+        presentation.replaceAllText("{{" + key + "}}", refreshedRowData[key] || "");
+      });
+
+      imageMappings.forEach((mapping) => {
+        const imageValue = String(refreshedRowData[mapping.column] || "").trim();
+
+        if (imageValue !== "") {
+          try {
+            const fileId = extractDriveFileId(imageValue);
+            replacePlaceholderWithDriveImage(presentation, mapping.placeholder, fileId);
+
+            Logger.log(
+              "Inserted image for " +
+              mapping.column +
+              " on row " +
+              (r + 1) +
+              ": " +
+              reportName
+            );
+          } catch (imageError) {
+            Logger.log(
+              "Failed to insert image for " +
+              mapping.column +
+              " on row " +
+              (r + 1) +
+              " (" +
+              reportName +
+              "): " +
+              imageError.message
+            );
+          }
+        } else {
+          Logger.log(
+            "No value for " +
+            mapping.column +
+            " on row " +
+            (r + 1) +
+            ": " +
+            reportName
+          );
+        }
+      });
+
+      presentation.saveAndClose();
+      Logger.log("Created: " + reportName);
+    } catch (e) {
+      Logger.log("ERROR on row " + (r + 1) + " (" + reportName + "): " + e.message);
+    }
+  }
+}
+
+function buildInsight(rowData) {
+  const reportName = rowData["Report Name"] || "This campaign";
+  const advertiser = rowData["Advertiser"] || "";
+  const cvrType = (rowData["CVR Type"] || "conversions").toLowerCase();
+
+  const vvcr = parsePercent(rowData["VVCR"]);
+  const cvrLift = parsePercent(rowData["CVR Lift"]);
+  const conf = normalizeConfidence(rowData["CVR Lift Conf"]);
+
+  let performanceDesc = "delivered solid overall performance";
+  if (vvcr >= 95) {
+    performanceDesc = "delivered very strong video engagement";
+  } else if (vvcr >= 85) {
+    performanceDesc = "delivered strong video engagement";
+  } else if (vvcr > 0) {
+    performanceDesc = "delivered moderate video engagement";
+  }
+
+  let outcomeDesc = "";
+  if (cvrLift >= 5 && conf >= 95) {
+    outcomeDesc = "Measurement results showed statistically significant impact on " + cvrType + ", indicating the campaign effectively moved consumers toward action.";
+  } else if (cvrLift > 0 && conf >= 80) {
+    outcomeDesc = "Measurement results showed a positive signal on " + cvrType + ", suggesting the campaign messaging and media approach were directionally effective.";
+  } else if (cvrLift > 0) {
+    outcomeDesc = "Measurement results showed early signs of impact on " + cvrType + ", though the findings would benefit from additional validation.";
+  } else if (cvrLift <= 0 && conf >= 80) {
+    outcomeDesc = "Measurement results indicated limited impact on " + cvrType + ", suggesting the current strategy may require refinement.";
+  } else {
+    outcomeDesc = "Measurement results were mixed, making it difficult to draw a strong conclusion on campaign impact.";
+  }
+
+  let recommendation = "";
+  if (cvrLift >= 5 && conf >= 95) {
+    recommendation = "Recommendation: Maintain the strongest elements of the current approach while testing complementary ad product mixes to understand whether additional formats or placements can unlock even greater performance at scale.";
+  } else if (cvrLift > 0 && conf >= 80) {
+    recommendation = "Recommendation: Keep the core strategy in market, while testing new ad product mixes to identify whether a different balance of formats, placements, or funnel tactics can strengthen results and improve efficiency.";
+  } else if (cvrLift > 0) {
+    recommendation = "Recommendation: Treat this as a directional learning and use future flights to test alternative ad product mixes, along with creative and audience refinements, to better understand what combination drives the strongest outcome.";
+  } else {
+    recommendation = "Recommendation: Reevaluate the current approach and test a meaningfully different ad product mix, alongside updated creative or targeting, to determine whether a revised media strategy can generate stronger measurable impact.";
+  }
+
+  const subject = advertiser || reportName;
+  return subject + " " + performanceDesc + ". " + outcomeDesc + " " + recommendation;
+}
+
+function parsePercent(value) {
+  if (!value) return 0;
+  const cleaned = String(value).replace("%", "").replace(/,/g, "").trim();
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? 0 : num;
+}
+
+function normalizeConfidence(value) {
+  if (!value) return 0;
+  const cleaned = String(value).replace("%", "").trim().toLowerCase();
+
+  if (cleaned === "not sig") return 0;
+
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? 0 : num;
+}
+
+function replacePlaceholderWithDriveImage(presentation, placeholderText, fileId) {
+  const file = DriveApp.getFileById(fileId);
+  const mimeType = file.getMimeType();
+
+  if (!mimeType.startsWith("image/")) {
+    throw new Error("File for placeholder " + placeholderText + " is not an image. Mime type: " + mimeType);
+  }
+
+  const imageBlob = file.getBlob();
+  const slides = presentation.getSlides();
+  let found = false;
+
+  for (let i = 0; i < slides.length; i++) {
+    const slide = slides[i];
+    const result = findPlaceholderElement(slide.getPageElements(), placeholderText);
+
+    if (result) {
+      const element = result.element;
+      const left = element.getLeft();
+      const top = element.getTop();
+      const width = element.getWidth();
+      const height = element.getHeight();
+
+      slide.insertImage(imageBlob, left, top, width, height);
+      element.remove();
+
+      Logger.log("Inserted image into slide " + (i + 1) + " for placeholder " + placeholderText);
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    throw new Error(
+      'Placeholder ' + placeholderText + ' not found. Put a normal text box on the slide itself containing exactly ' + placeholderText
+    );
+  }
+}
+
+function findPlaceholderElement(pageElements, placeholderText) {
+  for (let i = 0; i < pageElements.length; i++) {
+    const element = pageElements[i];
+    const type = element.getPageElementType();
+
+    if (type === SlidesApp.PageElementType.SHAPE) {
+      try {
+        const text = element.asShape().getText().asString().trim();
+        if (normalizePlaceholder(text) === normalizePlaceholder(placeholderText)) {
+          return { element: element };
+        }
+      } catch (e) {}
+    }
+
+    if (type === SlidesApp.PageElementType.GROUP) {
+      try {
+        const children = element.asGroup().getChildren();
+        const result = findPlaceholderElement(children, placeholderText);
+        if (result) return result;
+      } catch (e) {}
+    }
+  }
+
+  return null;
+}
+
+function normalizePlaceholder(text) {
+  return String(text || "")
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+function extractDriveFileId(value) {
+  value = String(value || "").trim();
+
+  if (!value.includes("http")) {
+    return value;
+  }
+
+  let match = value.match(/\/file\/d\/([-\w]{25,})/);
+  if (match) return match[1];
+
+  match = value.match(/[?&]id=([-\w]{25,})/);
+  if (match) return match[1];
+
+  match = value.match(/[-\w]{25,}/);
+  if (match) return match[0];
+
+  throw new Error("Could not extract Drive file ID from: " + value);
+}
+
+function getOrCreateColumn(sheet, headers, columnName) {
+  const existingIndex = headers.indexOf(columnName);
+  if (existingIndex !== -1) {
+    return existingIndex + 1;
+  }
+
+  const newCol = headers.length + 1;
+  sheet.getRange(1, newCol).setValue(columnName);
+  return newCol;
+}
+
+function ensureLeadingColumns(sheet, desiredHeaders) {
+  const currentHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+
+  for (let i = desiredHeaders.length - 1; i >= 0; i--) {
+    if (currentHeaders[i] !== desiredHeaders[i]) {
+      sheet.insertColumnBefore(1);
+    }
+  }
+
+  for (let i = 0; i < desiredHeaders.length; i++) {
+    sheet.getRange(1, i + 1).setValue(desiredHeaders[i]);
+  }
+}
+
+function getFiscalAttributes(date) {
+  const month = date.getMonth() + 1;
+  const calendarYear = date.getFullYear();
+
+  let quarter = "";
+  let season = "";
+  let fiscalYear = "";
+
+  if (month >= 7 && month <= 9) {
+    quarter = "Q1";
+    season = "Summer";
+    fiscalYear = "FY" + (calendarYear + 1);
+  } else if (month >= 10 && month <= 12) {
+    quarter = "Q2";
+    season = "Fall";
+    fiscalYear = "FY" + (calendarYear + 1);
+  } else if (month >= 1 && month <= 3) {
+    quarter = "Q3";
+    season = "Winter";
+    fiscalYear = "FY" + calendarYear;
+  } else {
+    quarter = "Q4";
+    season = "Spring";
+    fiscalYear = "FY" + calendarYear;
+  }
+
+  return {
+    quarter: quarter,
+    season: season,
+    year: fiscalYear
+  };
+}
