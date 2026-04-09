@@ -1,0 +1,823 @@
+function createWrapReportsForAllRows() {
+  const SPREADSHEET_ID = "17WN0e84Q6dansBrMu_PE1YhF1wmWobN0oIzb22RSR8s";
+  const TEMPLATE_ID = "1lmWSQJbZtMHf4M_m0S0GmJik1ba4ovZJRXwuixO6ktk";
+  const OUTPUT_FOLDER_ID = "1cleKvIbzlBwJDqoJI1lCkrN7hOl00kuD";
+  const BLS_PLACEHOLDER = "{{BLS_CHART}}";
+  const SALES_LIFT_PLACEHOLDER = "{{SALES_LIFT_CHART}}";
+
+  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = spreadsheet.getSheets()[0];
+  const folder = DriveApp.getFolderById(OUTPUT_FOLDER_ID);
+
+  ensureLeadingColumns(sheet, ["Quarter", "Season", "Year"]);
+
+  let data = sheet.getDataRange().getDisplayValues();
+  let headers = data[0];
+
+  getOrCreateColumn(sheet, headers, "Deck URL");
+  getOrCreateColumn(sheet, headers, "Generated At");
+
+  data = sheet.getDataRange().getDisplayValues();
+  headers = data[0];
+
+  const quarterCol = headers.indexOf("Quarter") + 1;
+  const seasonCol = headers.indexOf("Season") + 1;
+  const yearCol = headers.indexOf("Year") + 1;
+  const deckUrlColUpdated = headers.indexOf("Deck URL") + 1;
+  const generatedAtColUpdated = headers.indexOf("Generated At") + 1;
+
+  if (data.length < 2) {
+    Logger.log("No campaign rows found.");
+    return;
+  }
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+
+    if (row.join("").trim() === "") continue;
+
+    const rowData = {};
+    headers.forEach((header, i) => {
+      rowData[header] = row[i];
+    });
+
+    const campaignName = String(rowData["Campaign Name"] || "").trim();
+    const existingDeckUrl = String(rowData["Deck URL"] || "").trim();
+    const reportName = rowData["Report Name"] || ("Wrap Report " + r);
+
+    if (campaignName === "") {
+      Logger.log("Skipped row " + (r + 1) + ": Campaign Name is blank.");
+      continue;
+    }
+
+    if (existingDeckUrl !== "") {
+      Logger.log("Skipped existing report for row " + (r + 1) + ": " + reportName);
+      continue;
+    }
+
+    try {
+      const copy = DriveApp.getFileById(TEMPLATE_ID).makeCopy(
+        reportName + " - Wrap Report",
+        folder
+      );
+
+      const presentation = SlidesApp.openById(copy.getId());
+      const generatedAt = new Date();
+
+      sheet.getRange(r + 1, generatedAtColUpdated).setValue(generatedAt);
+
+      const campaignStartDate = parseSheetDate(rowData["Campaign Start Date"]);
+      if (!campaignStartDate) {
+        throw new Error('Invalid or blank "Campaign Start Date" for row ' + (r + 1));
+      }
+
+      const fiscal = getFiscalAttributes(campaignStartDate);
+      sheet.getRange(r + 1, quarterCol).setValue(fiscal.quarter);
+      sheet.getRange(r + 1, seasonCol).setValue(fiscal.season);
+      sheet.getRange(r + 1, yearCol).setValue(fiscal.year);
+
+      const deckUrl = presentation.getUrl();
+      sheet.getRange(r + 1, deckUrlColUpdated).setValue(deckUrl);
+
+      SpreadsheetApp.flush();
+
+      const refreshedHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+      const refreshedRow = sheet.getRange(r + 1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+
+      const refreshedRowData = {};
+      refreshedHeaders.forEach((header, i) => {
+        refreshedRowData[header] = refreshedRow[i];
+      });
+
+      const narrative = buildNarrative(refreshedRowData);
+      refreshedRowData["Insight"] = narrative.summary;
+      refreshedRowData["Recommendations"] = narrative.recommendations;
+
+      refreshedHeaders.forEach((header) => {
+        presentation.replaceAllText("{{" + header + "}}", refreshedRowData[header] || "");
+      });
+
+      presentation.replaceAllText("{{Insight}}", refreshedRowData["Insight"] || "");
+      presentation.replaceAllText("{{Recommendations}}", refreshedRowData["Recommendations"] || "");
+
+      const blsChartValue = String(refreshedRowData["BLS Chart"] || "").trim();
+      if (blsChartValue !== "") {
+        try {
+          const fileId = extractDriveFileId(blsChartValue);
+          replacePlaceholderWithDriveImage(presentation, BLS_PLACEHOLDER, fileId);
+          Logger.log("Inserted BLS chart for row " + (r + 1) + ": " + reportName);
+        } catch (imageError) {
+          Logger.log("Failed to insert BLS chart for row " + (r + 1) + " (" + reportName + "): " + imageError.message);
+        }
+      } else {
+        Logger.log("No BLS Chart value for row " + (r + 1) + ": " + reportName);
+      }
+
+      const salesLiftChartValue = String(refreshedRowData["Sales Lift Chart"] || "").trim();
+      if (salesLiftChartValue !== "") {
+        try {
+          const fileId = extractDriveFileId(salesLiftChartValue);
+          replacePlaceholderWithDriveImage(presentation, SALES_LIFT_PLACEHOLDER, fileId);
+          Logger.log("Inserted Sales Lift chart for row " + (r + 1) + ": " + reportName);
+        } catch (imageError) {
+          Logger.log("Failed to insert Sales Lift chart for row " + (r + 1) + " (" + reportName + "): " + imageError.message);
+        }
+      } else {
+        Logger.log("No Sales Lift Chart value for row " + (r + 1) + ": " + reportName);
+      }
+
+      presentation.saveAndClose();
+      Logger.log("Created: " + reportName);
+    } catch (e) {
+      Logger.log("ERROR on row " + (r + 1) + " (" + reportName + "): " + e.message);
+    }
+  }
+}
+
+function replacePlaceholderWithDriveImage(presentation, placeholderText, fileId) {
+  const file = DriveApp.getFileById(fileId);
+  const mimeType = file.getMimeType();
+
+  if (!mimeType.startsWith("image/")) {
+    throw new Error("Chart file is not an image. Mime type: " + mimeType);
+  }
+
+  const imageBlob = file.getBlob();
+  const slides = presentation.getSlides();
+  let found = false;
+
+  for (let i = 0; i < slides.length; i++) {
+    const slide = slides[i];
+    const result = findPlaceholderElement(slide.getPageElements(), placeholderText);
+
+    if (result) {
+      const element = result.element;
+      const left = element.getLeft();
+      const top = element.getTop();
+      const width = element.getWidth();
+      const height = element.getHeight();
+
+      slide.insertImage(imageBlob, left, top, width, height);
+      element.remove();
+
+      Logger.log("Inserted image into slide " + (i + 1));
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    throw new Error(
+      'Placeholder ' + placeholderText + ' not found. Put a normal text box on the slide itself containing exactly ' + placeholderText
+    );
+  }
+}
+
+function findPlaceholderElement(pageElements, placeholderText) {
+  for (let i = 0; i < pageElements.length; i++) {
+    const element = pageElements[i];
+    const type = element.getPageElementType();
+
+    if (type === SlidesApp.PageElementType.SHAPE) {
+      try {
+        const text = element.asShape().getText().asString().trim();
+        if (normalizePlaceholder(text) === normalizePlaceholder(placeholderText)) {
+          return { element: element };
+        }
+      } catch (e) {}
+    }
+
+    if (type === SlidesApp.PageElementType.GROUP) {
+      try {
+        const children = element.asGroup().getChildren();
+        const result = findPlaceholderElement(children, placeholderText);
+        if (result) return result;
+      } catch (e) {}
+    }
+  }
+
+  return null;
+}
+
+function normalizePlaceholder(text) {
+  return String(text || "")
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+function extractDriveFileId(value) {
+  value = String(value || "").trim();
+
+  if (!value.includes("http")) {
+    return value;
+  }
+
+  let match = value.match(/\/file\/d\/([-\w]{25,})/);
+  if (match) return match[1];
+
+  match = value.match(/[?&]id=([-\w]{25,})/);
+  if (match) return match[1];
+
+  match = value.match(/[-\w]{25,}/);
+  if (match) return match[0];
+
+  throw new Error("Could not extract Drive file ID from: " + value);
+}
+
+function getOrCreateColumn(sheet, headers, columnName) {
+  const existingIndex = headers.indexOf(columnName);
+  if (existingIndex !== -1) {
+    return existingIndex + 1;
+  }
+
+  const newCol = headers.length + 1;
+  sheet.getRange(1, newCol).setValue(columnName);
+  return newCol;
+}
+
+function ensureLeadingColumns(sheet, desiredHeaders) {
+  const currentHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+
+  for (let i = desiredHeaders.length - 1; i >= 0; i--) {
+    if (currentHeaders[i] !== desiredHeaders[i]) {
+      sheet.insertColumnBefore(1);
+    }
+  }
+
+  for (let i = 0; i < desiredHeaders.length; i++) {
+    sheet.getRange(1, i + 1).setValue(desiredHeaders[i]);
+  }
+}
+
+function parseSheetDate(value) {
+  if (!value) return null;
+
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+    return value;
+  }
+
+  const parsed = new Date(value);
+  if (!isNaN(parsed.getTime())) {
+    return parsed;
+  }
+
+  return null;
+}
+
+function getFiscalAttributes(date) {
+  const month = date.getMonth() + 1;
+  const year = date.getFullYear();
+
+  let quarter = "";
+  let season = "";
+
+  if (month >= 1 && month <= 3) {
+    quarter = "Q1";
+  } else if (month >= 4 && month <= 6) {
+    quarter = "Q2";
+  } else if (month >= 7 && month <= 9) {
+    quarter = "Q3";
+  } else {
+    quarter = "Q4";
+  }
+
+  if (month === 12 || month === 1 || month === 2) {
+    season = "Winter";
+  } else if (month >= 3 && month <= 5) {
+    season = "Spring";
+  } else if (month >= 6 && month <= 8) {
+    season = "Summer";
+  } else {
+    season = "Fall";
+  }
+
+  return {
+    quarter: quarter,
+    season: season,
+    year: year
+  };
+}
+
+function buildNarrative(rowData) {
+  const campaignName = firstNonEmpty([
+    rowData["Report Name"],
+    "the campaign"
+  ]);
+
+  const advertiser = firstNonEmpty([
+    rowData["Advertiser"]
+  ]);
+
+  const conversion1 = {
+    type: firstNonEmpty([rowData["CVR Type"]]),
+    lift: formatPercent(rowData["CVR Lift"]),
+    conf: firstNonEmpty([rowData["CVR Lift Conf"]]),
+    inc: formatNumber(rowData["Inc Count"]),
+    cpic: formatCurrency(rowData["CPIC"])
+  };
+
+  const conversion2 = {
+    type: firstNonEmpty([rowData["CVR Type 2"]]),
+    lift: formatPercent(rowData["CVR Lift 2"]),
+    conf: firstNonEmpty([rowData["CVR Lift Conf 2"]]),
+    inc: formatNumber(rowData["Inc Count 2"]),
+    cpic: formatCurrency(rowData["CPIC 2"])
+  };
+
+  const conversion3 = {
+    type: firstNonEmpty([rowData["CVR Type 3"]]),
+    lift: formatPercent(rowData["CVR Lift 3"]),
+    conf: firstNonEmpty([rowData["CVR Lift Conf 3"]]),
+    inc: formatNumber(rowData["Inc Count 3"]),
+    cpic: formatCurrency(rowData["CPIC 3"])
+  };
+
+  const conversions = [conversion1, conversion2, conversion3].filter(function(item) {
+    return item.type !== "" || item.lift !== "" || item.inc !== "";
+  });
+
+  const sales1 = {
+    type: firstNonEmpty([rowData["Sales Type"]]),
+    lift: formatPercent(rowData["Sales Lift"]),
+    conf: firstNonEmpty([rowData["Sales Lift Conf"]]),
+    incSales: formatNumber(rowData["Inc Sales"])
+  };
+
+  const sales2 = {
+    type: firstNonEmpty([rowData["Sales Type 2"]]),
+    lift: formatPercent(rowData["Sales Lift 2"])
+  };
+
+  const sales3 = {
+    type: firstNonEmpty([rowData["Sales Type 3"]]),
+    lift: formatPercent(rowData["Sales Lift 3"])
+  };
+
+  const salesMetrics = [sales1, sales2, sales3].filter(function(item) {
+    return item.type !== "" || item.lift !== "" || item.incSales !== "";
+  });
+
+  const iroas = formatNumber(rowData["IROAS"]);
+
+  const brandMetrics = [
+    {
+      kpi: firstNonEmpty([rowData["BLS KPI 1"]]),
+      lift: formatPercent(rowData["KPI 1Abs Lift"]),
+      conf: firstNonEmpty([rowData["KPI 1 Conf"]])
+    },
+    {
+      kpi: firstNonEmpty([rowData["BLS KPI 2"]]),
+      lift: formatPercent(rowData["KPI 2 Abs Lift"]),
+      conf: firstNonEmpty([rowData["KPI 2 Conf"]])
+    },
+    {
+      kpi: firstNonEmpty([rowData["BLS KPI 3"]]),
+      lift: formatPercent(rowData["KPI 3 Abs Lift"]),
+      conf: firstNonEmpty([rowData["KPI 3 Conf"]])
+    },
+    {
+      kpi: firstNonEmpty([rowData["BLS KPI 4"]]),
+      lift: formatPercent(rowData["KPI 4 Abs Lift"]),
+      conf: firstNonEmpty([rowData["KPI 4 Conf"]])
+    },
+    {
+      kpi: firstNonEmpty([rowData["BLS KPI 5"]]),
+      lift: formatPercent(rowData["KPI 5 Abs Lift"]),
+      conf: firstNonEmpty([rowData["KPI 5 Conf"]])
+    }
+  ].filter(function(item) {
+    return item.kpi !== "" || item.lift !== "";
+  });
+
+  const visitLift = formatPercent(rowData["Incremental Visit Lift %"]);
+  const incrementalVisits = formatNumber(rowData["Incremental Visits"]);
+  const totalIncrementalVisits = formatNumber(rowData["Total Incremental Visits"]);
+  const cpiv = formatCurrency(rowData["CPIV"]);
+  const weeklyFrequency = formatNumber(rowData["Weekly Frequency"]);
+  const weeklyFrequencyValue = numericValue(weeklyFrequency);
+
+  const hasConversion = conversions.length > 0;
+  const hasSales = salesMetrics.length > 0 || iroas !== "";
+  const hasBrand = brandMetrics.length > 0;
+  const hasVisit = visitLift !== "" || incrementalVisits !== "" || totalIncrementalVisits !== "" || cpiv !== "";
+
+  const recommendationBullets = [];
+  let summary = "";
+
+  const topConversion = conversions[0] || null;
+  const topSales = salesMetrics[0] || null;
+  const topBrand = getStrongestBrandMetric(brandMetrics);
+
+  const resultsAreWeak = isWeakResults({
+    topConversion: topConversion,
+    topSales: topSales,
+    topBrand: topBrand,
+    visitLift: visitLift,
+    iroas: iroas
+  });
+
+  const topOutcomes = [];
+  if (topConversion && topConversion.lift) {
+    topOutcomes.push(topConversion.lift + " lift in " + normalizeLabel(topConversion.type, "conversion"));
+  }
+  if (topSales && topSales.lift) {
+    topOutcomes.push(topSales.lift + " lift in " + normalizeLabel(topSales.type, "sales"));
+  }
+  if (topBrand && topBrand.kpi && topBrand.lift) {
+    topOutcomes.push(topBrand.lift + " lift in " + topBrand.kpi);
+  }
+  if (visitLift) {
+    topOutcomes.push(visitLift + " lift in visitation");
+  }
+
+  if (countTrue([hasConversion, hasSales, hasBrand, hasVisit]) >= 2) {
+    summary =
+      campaignName +
+      " demonstrated that Tubi can drive measurable cross-funnel impact for " +
+      advertiserOrFallback(advertiser) + ", ";
+
+    if (topOutcomes.length > 0) {
+      summary += "including " + joinWithAnd(topOutcomes) + ".";
+    } else {
+      summary += "with results across multiple campaign objectives.";
+    }
+
+    if (topConversion && topConversion.inc) {
+      summary += " The campaign generated " + topConversion.inc + " incremental " +
+        normalizePluralLabel(topConversion.type, "conversions") + ".";
+    }
+
+    if (topSales && topSales.incSales) {
+      summary += " Incremental sales reached " + topSales.incSales + ".";
+    }
+
+    if (totalIncrementalVisits) {
+      summary += " Total incremental visits reached " + totalIncrementalVisits + ".";
+    }
+
+    if (iroas) {
+      summary += " Efficiency remained strong, with an IROAS of " + iroas + ".";
+    } else if (topConversion && topConversion.cpic) {
+      summary += " Cost efficiency was measured at " + topConversion.cpic + " CPIC.";
+    } else if (cpiv) {
+      summary += " Visitation efficiency was measured at " + cpiv + " CPIV.";
+    }
+
+    summary += " These results reinforce Tubi’s value as a partner that can support both brand-building and performance goals.";
+
+    recommendationBullets.push(
+      "Use this campaign as a proof point for broader cross-funnel investment on Tubi, especially where both awareness and action are important success metrics."
+    );
+
+    recommendationBullets.push(
+      "Prioritize the audiences, creative approaches, and placements that drove the strongest response, then scale those learnings into future campaigns."
+    );
+
+    recommendationBullets.push(
+      "Build on this momentum with repeat investment that connects upper-funnel messaging to lower-funnel conversion or sales-driving tactics."
+    );
+
+    if (iroas || (topConversion && topConversion.cpic) || cpiv) {
+      recommendationBullets.push(
+        "Leverage these efficiency benchmarks to support increased investment with greater confidence and clearer performance expectations."
+      );
+    }
+  } else if (hasConversion) {
+    summary =
+      campaignName +
+      " showed that Tubi can drive meaningful lower-funnel action for " +
+      advertiserOrFallback(advertiser);
+
+    if (topConversion && topConversion.type && topConversion.lift) {
+      summary += ", delivering a " + topConversion.lift + " lift in " + topConversion.type.toLowerCase();
+    } else if (topConversion && topConversion.lift) {
+      summary += ", delivering a " + topConversion.lift + " conversion lift";
+    }
+
+    summary += ".";
+
+    if (topConversion && topConversion.inc) {
+      summary += " The campaign generated " + topConversion.inc + " incremental " +
+        normalizePluralLabel(topConversion.type, "conversions") + ".";
+    }
+
+    if (topConversion && topConversion.cpic) {
+      summary += " Cost efficiency was measured at " + topConversion.cpic + " CPIC.";
+    }
+
+    summary += " This suggests Tubi can be a strong partner for performance-oriented campaigns designed to drive measurable action.";
+
+    recommendationBullets.push(
+      "Increase investment in the Tubi audiences and placements that drove the strongest conversion response to build on this performance."
+    );
+
+    recommendationBullets.push(
+      "Use these results to inform future performance-focused campaigns, with continued emphasis on creative and targeting strategies that moved consumers to action."
+    );
+
+    recommendationBullets.push(
+      "Consider repeat engagement on Tubi to reinforce lower-funnel momentum and create a stronger foundation for future conversion efficiency."
+    );
+  } else if (hasSales) {
+    summary =
+      campaignName +
+      " generated measurable sales impact, indicating that Tubi can contribute to meaningful business outcomes for " +
+      advertiserOrFallback(advertiser);
+
+    if (topSales && topSales.type && topSales.lift) {
+      summary += ", including a " + topSales.lift + " lift in " + topSales.type.toLowerCase();
+    } else if (topSales && topSales.lift) {
+      summary += ", including a " + topSales.lift + " sales lift";
+    }
+
+    summary += ".";
+
+    if (topSales && topSales.incSales) {
+      summary += " Incremental sales reached " + topSales.incSales + ".";
+    }
+
+    if (iroas) {
+      summary += " IROAS was " + iroas + ".";
+    }
+
+    summary += " These results strengthen the case for Tubi as a channel that can deliver not just reach, but real commercial impact.";
+
+    recommendationBullets.push(
+      "Use these outcomes to support continued or increased investment in Tubi strategies that are aligned to revenue and sales-driving objectives."
+    );
+
+    recommendationBullets.push(
+      "Apply observed return and sales benchmarks to future planning, prioritizing tactics that can scale while maintaining efficiency."
+    );
+
+    recommendationBullets.push(
+      "Position Tubi as a repeatable part of the media mix for campaigns where business outcome accountability is critical."
+    );
+  } else if (hasBrand) {
+    summary =
+      campaignName +
+      " strengthened upper-funnel performance, showing that Tubi can effectively influence brand perceptions for " +
+      advertiserOrFallback(advertiser);
+
+    if (topBrand && topBrand.kpi && topBrand.lift) {
+      summary += " with a " + topBrand.lift + " lift in " + topBrand.kpi;
+    }
+
+    summary += ".";
+
+    if (brandMetrics.length > 1) {
+      summary += " Multiple brand metrics showed positive movement, reinforcing the effectiveness of the campaign messaging within the Tubi environment.";
+    } else {
+      summary += " This result reinforces Tubi’s ability to drive meaningful brand impact in addition to scale and reach.";
+    }
+
+    recommendationBullets.push(
+      "Maintain or increase investment on Tubi for future campaigns where awareness, favorability, or intent are important brand objectives."
+    );
+
+    recommendationBullets.push(
+      "Continue building on the messaging and audience strategy that drove the strongest brand response to deepen advertiser confidence over time."
+    );
+
+    recommendationBullets.push(
+      "Where possible, pair future upper-funnel efforts with downstream measurement to further demonstrate how Tubi-driven brand momentum contributes to broader business outcomes."
+    );
+  } else if (hasVisit) {
+    summary =
+      campaignName +
+      " drove measurable visitation impact, suggesting that Tubi can successfully motivate consumers to take real-world action for " +
+      advertiserOrFallback(advertiser);
+
+    if (visitLift) {
+      summary += ", including a " + visitLift + " lift in visitation";
+    }
+
+    summary += ".";
+
+    if (incrementalVisits) {
+      summary += " Incremental visits reached " + incrementalVisits + ".";
+    }
+
+    if (totalIncrementalVisits) {
+      summary += " Total incremental visits reached " + totalIncrementalVisits + ".";
+    }
+
+    if (cpiv) {
+      summary += " CPIV was " + cpiv + ".";
+    }
+
+    summary += " These results reinforce Tubi’s ability to influence offline behavior and support action-oriented campaign goals.";
+
+    recommendationBullets.push(
+      "Lean further into Tubi as a driver of real-world action, especially in markets, audience segments, and placements that showed the strongest visitation response."
+    );
+
+    recommendationBullets.push(
+      "Use these results to support repeat investment in campaigns where store, venue, or location visitation is a key objective."
+    );
+
+    recommendationBullets.push(
+      "Refine geographic targeting, frequency, and creative strategy in future campaigns to further improve visitation efficiency."
+    );
+  } else {
+    summary =
+      campaignName +
+      " delivered meaningful learnings that can help guide future strategy, while reinforcing Tubi’s value as a flexible partner capable of supporting multiple advertiser objectives.";
+
+    recommendationBullets.push(
+      "Use this campaign as a directional benchmark and continue testing audiences, creative, and media mix to identify the strongest drivers of impact on Tubi."
+    );
+
+    recommendationBullets.push(
+      "Build on these learnings in future campaigns to strengthen performance and deepen confidence in Tubi as an ongoing investment partner."
+    );
+  }
+
+  const frequencyNarrative = getFrequencyNarrative(weeklyFrequencyValue, resultsAreWeak);
+
+  if (frequencyNarrative.summaryNote) {
+    summary += " " + frequencyNarrative.summaryNote;
+  }
+
+  if (frequencyNarrative.recommendation) {
+    recommendationBullets.push(frequencyNarrative.recommendation);
+  }
+
+  return {
+    summary: summary,
+    recommendations: recommendationBullets.map(function(item) {
+      return "• " + item;
+    }).join("\n")
+  };
+}
+
+function getFrequencyNarrative(weeklyFrequency, resultsAreWeak) {
+  if (isNaN(weeklyFrequency) || weeklyFrequency < 0) {
+    return {
+      summaryNote: "",
+      recommendation: ""
+    };
+  }
+
+  if (weeklyFrequency < 0.5) {
+    return {
+      summaryNote: "Weekly frequency was light, suggesting there may be room to improve message retention and campaign impact through more consistent exposure.",
+      recommendation: "Increase weekly frequency in future campaigns to strengthen message retention and improve the likelihood of driving measurable response."
+    };
+  }
+
+  if (weeklyFrequency >= 0.5 && weeklyFrequency < 0.8) {
+    return {
+      summaryNote: "Weekly frequency was relatively light, leaving potential headroom to build stronger repetition if greater impact is desired.",
+      recommendation: "Consider testing a higher weekly frequency to determine whether additional exposure can improve campaign performance without sacrificing efficiency."
+    };
+  }
+
+  if (weeklyFrequency >= 0.8 && weeklyFrequency <= 1.3) {
+    return {
+      summaryNote: "Weekly frequency was in a healthy range, supporting consistent exposure without indicating immediate frequency concerns.",
+      recommendation: ""
+    };
+  }
+
+  if (weeklyFrequency > 1.3) {
+    if (resultsAreWeak) {
+      return {
+        summaryNote: "Weekly frequency was elevated relative to results, suggesting the campaign may have approached or exceeded an efficient exposure level.",
+        recommendation: "Be mindful of possible overexposure in future campaigns and test a more balanced weekly frequency to improve efficiency if performance remains soft."
+      };
+    }
+
+    return {
+      summaryNote: "",
+      recommendation: ""
+    };
+  }
+
+  return {
+    summaryNote: "",
+    recommendation: ""
+  };
+}
+
+function isWeakResults(input) {
+  const conversionLiftValue = input.topConversion && input.topConversion.lift ? numericValue(input.topConversion.lift) : null;
+  const salesLiftValue = input.topSales && input.topSales.lift ? numericValue(input.topSales.lift) : null;
+  const brandLiftValue = input.topBrand && input.topBrand.lift ? numericValue(input.topBrand.lift) : null;
+  const visitLiftValue = input.visitLift ? numericValue(input.visitLift) : null;
+  const iroasValue = input.iroas ? numericValue(input.iroas) : null;
+
+  const positiveSignals = [];
+
+  if (conversionLiftValue !== null) positiveSignals.push(conversionLiftValue >= 1.0);
+  if (salesLiftValue !== null) positiveSignals.push(salesLiftValue >= 1.0);
+  if (brandLiftValue !== null) positiveSignals.push(brandLiftValue >= 1.0);
+  if (visitLiftValue !== null) positiveSignals.push(visitLiftValue >= 1.0);
+  if (iroasValue !== null) positiveSignals.push(iroasValue >= 1.0);
+
+  if (positiveSignals.length === 0) {
+    return false;
+  }
+
+  const positives = positiveSignals.filter(function(v) {
+    return v;
+  }).length;
+
+  return positives === 0;
+}
+
+function getStrongestBrandMetric(metrics) {
+  if (!metrics || metrics.length === 0) return null;
+
+  let best = metrics[0];
+  let bestValue = numericValue(metrics[0].lift);
+
+  for (let i = 1; i < metrics.length; i++) {
+    const currentValue = numericValue(metrics[i].lift);
+    if (currentValue > bestValue) {
+      best = metrics[i];
+      bestValue = currentValue;
+    }
+  }
+
+  return best;
+}
+
+function numericValue(value) {
+  const raw = String(value || "").replace(/[^0-9.\-]/g, "");
+  const num = Number(raw);
+  return isNaN(num) ? -999999 : num;
+}
+
+function advertiserOrFallback(advertiser) {
+  return advertiser && String(advertiser).trim() !== "" ? advertiser : "the advertiser";
+}
+
+function normalizeLabel(label, fallback) {
+  const clean = String(label || "").trim();
+  return clean !== "" ? clean : fallback;
+}
+
+function normalizePluralLabel(label, fallback) {
+  const clean = String(label || "").trim();
+  if (clean === "") return fallback;
+  return clean.toLowerCase();
+}
+
+function compact(values) {
+  const result = [];
+  for (let i = 0; i < values.length; i++) {
+    const v = String(values[i] || "").trim();
+    if (v !== "") result.push(v);
+  }
+  return result;
+}
+
+function countTrue(values) {
+  let count = 0;
+  for (let i = 0; i < values.length; i++) {
+    if (values[i]) count++;
+  }
+  return count;
+}
+
+function joinWithAnd(items) {
+  if (!items || items.length === 0) return "";
+  if (items.length === 1) return items[0];
+  if (items.length === 2) return items[0] + " and " + items[1];
+  return items.slice(0, -1).join(", ") + ", and " + items[items.length - 1];
+}
+
+function firstNonEmpty(values) {
+  for (let i = 0; i < values.length; i++) {
+    const v = String(values[i] || "").trim();
+    if (v !== "") return v;
+  }
+  return "";
+}
+
+function formatPercent(value) {
+  const cleaned = cleanNumeric(value);
+  if (cleaned === "") return "";
+  return cleaned + "%";
+}
+
+function formatCurrency(value) {
+  const cleaned = cleanNumeric(value);
+  if (cleaned === "") return "";
+  return "$" + cleaned;
+}
+
+function formatNumber(value) {
+  return cleanNumeric(value);
+}
+
+function cleanNumeric(value) {
+  const raw = String(value || "").trim();
+  if (raw === "") return "";
+
+  const numeric = raw.replace(/[^0-9.\-]/g, "");
+  if (numeric === "" || isNaN(Number(numeric))) return "";
+
+  return Number(numeric).toFixed(1).replace(/\.0$/, "");
+}
