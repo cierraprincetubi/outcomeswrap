@@ -1,0 +1,542 @@
+function generateAndAttachAllCharts() {
+  const SPREADSHEET_ID = "17WN0e84Q6dansBrMu_PE1YhF1wmWobN0oIzb22RSR8s";
+  const SHEET_NAME = ""; // leave blank to use first sheet
+  const SALES_CHART_FOLDER_ID = "1v7RQHU8l3AF1JTQ4J9SIBcn_10N11Yq5";
+  const BLS_CHART_FOLDER_ID = "1lwlkt4vzohLCFsofIsU7kzGI0ZgAmE2q";
+
+  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = SHEET_NAME
+    ? spreadsheet.getSheetByName(SHEET_NAME)
+    : spreadsheet.getSheets()[0];
+
+  if (!sheet) {
+    throw new Error("Sheet not found.");
+  }
+
+  const data = sheet.getDataRange().getDisplayValues();
+  if (data.length < 2) {
+    Logger.log("No data rows found.");
+    return;
+  }
+
+  let headers = data[0];
+
+  getRequiredColumnIndex_(headers, "Report Name");
+  const salesChartUrlCol = getOrCreateColumn_(sheet, headers, "Sales Chart URL");
+  const blsChartUrlCol = getOrCreateColumn_(sheet, headers, "BLS Chart URL");
+
+  headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+  const refreshedData = sheet.getDataRange().getDisplayValues();
+
+  const salesFolder = DriveApp.getFolderById(SALES_CHART_FOLDER_ID);
+  const blsFolder = DriveApp.getFolderById(BLS_CHART_FOLDER_ID);
+
+  for (let r = 1; r < refreshedData.length; r++) {
+    const row = refreshedData[r];
+    const rowData = buildRowObject_(headers, row);
+
+    const reportName = String(rowData["Report Name"] || "").trim();
+    if (!reportName) continue;
+
+    try {
+      const salesBlob = maybeBuildSalesChartBlob_(rowData, reportName);
+      if (salesBlob) {
+        const salesFile = upsertPngFile_(
+          salesFolder,
+          safeFileName_(reportName) + "_sales_chart.png",
+          salesBlob
+        );
+        sheet.getRange(r + 1, salesChartUrlCol).setValue(
+          directViewUrlFromFileId_(salesFile.getId())
+        );
+      }
+
+      const blsBlob = maybeBuildBlsChartBlob_(rowData, reportName);
+      if (blsBlob) {
+        const blsFile = upsertPngFile_(
+          blsFolder,
+          safeFileName_(reportName) + "_bls_chart.png",
+          blsBlob
+        );
+        sheet.getRange(r + 1, blsChartUrlCol).setValue(
+          directViewUrlFromFileId_(blsFile.getId())
+        );
+      }
+
+      Logger.log("Processed row " + (r + 1) + ": " + reportName);
+    } catch (e) {
+      Logger.log("FAILED: " + reportName + " | " + e.message);
+    }
+  }
+
+  SpreadsheetApp.flush();
+  Logger.log("Done generating and attaching charts.");
+}
+
+function maybeBuildSalesChartBlob_(rowData, reportName) {
+  const totalLift = parsePercentNumber_(rowData["Sales Lift"]);
+  const inStoreLift = parsePercentNumber_(rowData["Sales Lift 2"]);
+  const ecommerceLift = parsePercentNumber_(rowData["Sales Lift 3"]);
+
+  Logger.log(JSON.stringify({
+    reportName: reportName,
+    salesLift: rowData["Sales Lift"],
+    salesLift2: rowData["Sales Lift 2"],
+    salesLift3: rowData["Sales Lift 3"],
+    parsedTotalLift: totalLift,
+    parsedInStoreLift: inStoreLift,
+    parsedEcommerceLift: ecommerceLift
+  }));
+
+  if (totalLift === null && inStoreLift === null && ecommerceLift === null) {
+    return null;
+  }
+
+  const labels = [
+    "In-Store Sales Lift",
+    "e-Commerce Sales Lift",
+    "Total Sales Lift"
+  ];
+
+  const values = [
+    inStoreLift !== null ? inStoreLift : 0,
+    ecommerceLift !== null ? ecommerceLift : 0,
+    totalLift !== null ? totalLift : 0
+  ];
+
+  const chartConfig = {
+    type: "bar",
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          data: values,
+          backgroundColor: ["#FFDE21", "#FFDE21", "#FFDE21"],
+          borderRadius: 6,
+          borderSkipped: false,
+          barThickness: 42
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: {
+        padding: { top: 20, right: 20, bottom: 10, left: 10 }
+      },
+      plugins: {
+        legend: { display: false },
+        title: {
+          display: true,
+          text: reportName + " Sales Lift",
+          color: "#FFFFFF",
+          font: { size: 20, weight: "bold" },
+          padding: { bottom: 20 }
+        },
+        datalabels: {
+          anchor: "end",
+          align: "end",
+          color: "#FFFFFF",
+          font: { weight: "bold", size: 12 },
+          formatter: function(value) {
+            return value.toFixed(1) + "%";
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: {
+            color: "#FFFFFF",
+            font: { size: 11 },
+            maxRotation: 0,
+            minRotation: 0
+          },
+          grid: { display: false },
+          border: { display: false }
+        },
+        y: {
+          beginAtZero: true,
+          ticks: {
+            color: "#FFFFFF",
+            font: { size: 11 },
+            callback: function(value) {
+              return value + "%";
+            }
+          },
+          grid: {
+            color: "rgba(255,255,255,0.12)",
+            drawBorder: false
+          },
+          border: { display: false }
+        }
+      }
+    },
+    plugins: ["chartjs-plugin-datalabels"]
+  };
+
+  return fetchQuickChartPng_(
+    chartConfig,
+    safeFileName_(reportName) + "_sales_chart.png",
+    1000,
+    650
+  );
+}
+
+function maybeBuildBlsChartBlob_(rowData, reportName) {
+  const labels = [];
+  const controlValues = [];
+  const exposedValues = [];
+  const annotations = {};
+
+  for (let i = 1; i <= 5; i++) {
+    const kpi = String(rowData["BLS KPI " + i] || "").trim();
+    const control = parsePercentNumber_(rowData["KPI " + i + " Control"]);
+    const exposed = parsePercentNumber_(rowData["KPI " + i + " Treated"]);
+    const confRaw = String(rowData["KPI " + i + " Conf"] || "").trim();
+
+    if (!kpi || control === null || exposed === null) continue;
+
+    const lift = round1_(exposed - control);
+    const label = shortenBlsKpiLabel_(kpi);
+    const bubbleColor = getLiftBubbleColor_(lift, confRaw);
+    const sign = lift > 0 ? "+" : "";
+
+    labels.push(label);
+    controlValues.push(control);
+    exposedValues.push(exposed);
+
+    annotations["bubble_" + i] = {
+      type: "label",
+      xValue: label,
+      yValue: exposed + 2,
+      backgroundColor: bubbleColor,
+      content: [sign + lift.toFixed(1)],
+      color: "#FFFFFF",
+      font: {
+        size: 10,
+        weight: "bold"
+      },
+      padding: 6,
+      borderRadius: 999
+    };
+  }
+
+  Logger.log(JSON.stringify({
+    reportName: reportName,
+    blsLabels: labels,
+    blsControlValues: controlValues,
+    blsExposedValues: exposedValues,
+    annotations: annotations
+  }));
+
+  if (!labels.length) return null;
+
+  const chartConfig = {
+    type: "bar",
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          label: "Control",
+          data: controlValues,
+          backgroundColor: "#BDBDBD",
+          borderRadius: 5,
+          borderSkipped: false,
+          barThickness: 24
+        },
+        {
+          label: "Exposed",
+          data: exposedValues,
+          backgroundColor: "#FFDE21",
+          borderRadius: 5,
+          borderSkipped: false,
+          barThickness: 24
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: {
+        padding: { top: 60, right: 20, bottom: 10, left: 10 }
+      },
+      plugins: {
+        legend: {
+          position: "top",
+          align: "end",
+          labels: {
+            color: "#FFFFFF",
+            font: { size: 11 },
+            boxWidth: 14
+          }
+        },
+        title: {
+          display: true,
+          text: reportName + " Brand Lift",
+          color: "#FFFFFF",
+          font: { size: 20, weight: "bold" },
+          padding: { bottom: 16 }
+        },
+        annotation: {
+          annotations: annotations
+        }
+      },
+      scales: {
+        x: {
+          ticks: {
+            color: "#FFFFFF",
+            font: { size: 11 },
+            maxRotation: 0,
+            minRotation: 0
+          },
+          grid: { display: false },
+          border: { display: false }
+        },
+        y: {
+          beginAtZero: true,
+          ticks: {
+            color: "#FFFFFF",
+            font: { size: 11 },
+            callback: function(value) {
+              return value + "%";
+            }
+          },
+          grid: {
+            color: "rgba(255,255,255,0.12)",
+            drawBorder: false
+          },
+          border: { display: false }
+        }
+      }
+    }
+  };
+
+  return fetchQuickChartPng_(
+    chartConfig,
+    safeFileName_(reportName) + "_bls_chart.png",
+    1200,
+    700
+  );
+}
+
+function fetchQuickChartPng_(chartConfig, filename, width, height) {
+  const payload = {
+    width: width,
+    height: height,
+    format: "png",
+    backgroundColor: "transparent",
+    devicePixelRatio: 2,
+    version: "4",
+    chart: chartConfig
+  };
+
+  const response = UrlFetchApp.fetch("https://quickchart.io/chart", {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const code = response.getResponseCode();
+  if (code !== 200) {
+    throw new Error("QuickChart error " + code + ": " + response.getContentText());
+  }
+
+  return response.getBlob().setName(filename);
+}
+
+function upsertPngFile_(folder, filename, blob) {
+  const existing = folder.getFilesByName(filename);
+  while (existing.hasNext()) {
+    existing.next().setTrashed(true);
+  }
+  blob.setName(filename);
+  return folder.createFile(blob);
+}
+
+function debugSalesFields() {
+  const SPREADSHEET_ID = "17WN0e84Q6dansBrMu_PE1YhF1wmWobN0oIzb22RSR8s";
+  const SHEET_NAME = "";
+
+  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = SHEET_NAME
+    ? spreadsheet.getSheetByName(SHEET_NAME)
+    : spreadsheet.getSheets()[0];
+
+  const data = sheet.getDataRange().getDisplayValues();
+  const headers = data[0];
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    const rowData = buildRowObject_(headers, row);
+    const reportName = String(rowData["Report Name"] || "").trim();
+    if (!reportName) continue;
+
+    const hasSales =
+      rowData["Sales Lift"] ||
+      rowData["Sales Lift 2"] ||
+      rowData["Sales Lift 3"];
+
+    if (!hasSales) continue;
+
+    Logger.log(
+      reportName +
+      " | Sales Lift=" + rowData["Sales Lift"] +
+      " | Sales Lift 2=" + rowData["Sales Lift 2"] +
+      " | Sales Lift 3=" + rowData["Sales Lift 3"]
+    );
+  }
+}
+
+function testSingleChartGeneration() {
+  const SPREADSHEET_ID = "17WN0e84Q6dansBrMu_PE1YhF1wmWobN0oIzb22RSR8s";
+  const SHEET_NAME = "";
+  const SALES_CHART_FOLDER_ID = "1v7RQHU8l3AF1JTQ4J9SIBcn_10N11Yq5";
+  const BLS_CHART_FOLDER_ID = "1lwlkt4vzohLCFsofIsU7kzGI0ZgAmE2q";
+
+  const TARGET_REPORT_NAME = "Kay";
+
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = SHEET_NAME ? ss.getSheetByName(SHEET_NAME) : ss.getSheets()[0];
+  const values = sheet.getDataRange().getDisplayValues();
+  const headers = values[0];
+
+  const reportNameIndex = headers.indexOf("Report Name");
+  if (reportNameIndex === -1) {
+    throw new Error('Column "Report Name" not found.');
+  }
+
+  const rowIndex = values.findIndex((r, i) => {
+    if (i === 0) return false;
+    return String(r[reportNameIndex] || "").trim() === TARGET_REPORT_NAME;
+  });
+
+  if (rowIndex === -1) {
+    throw new Error('Could not find Report Name: "' + TARGET_REPORT_NAME + '"');
+  }
+
+  const row = values[rowIndex];
+  const rowData = buildRowObject_(headers, row);
+
+  Logger.log(JSON.stringify(rowData));
+
+  const salesBlob = maybeBuildSalesChartBlob_(rowData, TARGET_REPORT_NAME);
+  if (salesBlob) {
+    const salesFile = upsertPngFile_(
+      DriveApp.getFolderById(SALES_CHART_FOLDER_ID),
+      safeFileName_(TARGET_REPORT_NAME) + "_sales_chart.png",
+      salesBlob
+    );
+    Logger.log("Sales chart created: " + salesFile.getUrl());
+  } else {
+    Logger.log("No sales chart data found.");
+  }
+
+  const blsBlob = maybeBuildBlsChartBlob_(rowData, TARGET_REPORT_NAME);
+  if (blsBlob) {
+    const blsFile = upsertPngFile_(
+      DriveApp.getFolderById(BLS_CHART_FOLDER_ID),
+      safeFileName_(TARGET_REPORT_NAME) + "_bls_chart.png",
+      blsBlob
+    );
+    Logger.log("BLS chart created: " + blsFile.getUrl());
+  } else {
+    Logger.log("No BLS chart data found.");
+  }
+}
+
+function buildRowObject_(headers, row) {
+  const out = {};
+  headers.forEach(function(header, i) {
+    out[header] = row[i];
+  });
+  return out;
+}
+
+function getRequiredColumnIndex_(headers, columnName) {
+  const idx = headers.indexOf(columnName);
+  if (idx === -1) {
+    throw new Error('Required column not found: "' + columnName + '"');
+  }
+  return idx + 1;
+}
+
+function getOrCreateColumn_(sheet, headers, columnName) {
+  const idx = headers.indexOf(columnName);
+  if (idx !== -1) return idx + 1;
+
+  const newCol = headers.length + 1;
+  sheet.getRange(1, newCol).setValue(columnName);
+  return newCol;
+}
+
+function parsePercentNumber_(value) {
+  if (value === null || value === undefined || value === "") return null;
+
+  const text = String(value).trim();
+  if (!text) return null;
+  if (/not sig/i.test(text)) return null;
+
+  if (text.indexOf("%") !== -1) {
+    const cleaned = text.replace("%", "").replace(/,/g, "").trim();
+    const num = parseFloat(cleaned);
+    return isNaN(num) ? null : num;
+  }
+
+  const cleaned = text.replace(/,/g, "").trim();
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? null : num;
+}
+
+function safeFileName_(value) {
+  return String(value || "")
+    .replace(/[\\\/:*?"<>|#]+/g, "")
+    .replace(/\s+/g, "_")
+    .trim();
+}
+
+function directViewUrlFromFileId_(fileId) {
+  return "https://drive.google.com/uc?export=view&id=" + fileId;
+}
+
+function shortenBlsKpiLabel_(label) {
+  const normalized = String(label || "").trim().toLowerCase();
+
+  if (normalized === "aided awareness") return "Awareness";
+  if (normalized === "awareness") return "Awareness";
+  if (normalized === "familiarity") return "Familiarity";
+  if (normalized === "favorability") return "Favorability";
+  if (normalized === "consideration") return "Consideration";
+  if (normalized === "purchase intent") return "Intent";
+
+  return label;
+}
+
+function round1_(value) {
+  return Math.round(value * 10) / 10;
+}
+
+function normalizeConfidence_(value) {
+  const text = String(value || "").trim().toLowerCase();
+
+  if (!text) return "";
+  if (text.indexOf("95") !== -1) return "95%";
+  if (text.indexOf("90") !== -1) return "90%";
+  if (text.indexOf("80") !== -1) return "80%";
+  if (text.indexOf("not sig") !== -1) return "Not Sig";
+
+  return String(value || "").trim();
+}
+
+function getLiftBubbleColor_(lift, confRaw) {
+  const conf = normalizeConfidence_(confRaw);
+
+  if (lift < 0) return "#F4A3A3";
+  if (lift === 0) return "#9E9E9E";
+
+  if (conf === "95%") return "#2E7D32";
+  if (conf === "90%") return "#66BB6A";
+  if (conf === "80%") return "#A5D6A7";
+
+  return "#9E9E9E";
+}
