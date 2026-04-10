@@ -100,7 +100,7 @@ function createWrapReportsForAllRows() {
       presentation.replaceAllText("{{Insight}}", refreshedRowData["Insight"] || "");
       presentation.replaceAllText("{{Recommendations}}", refreshedRowData["Recommendations"] || "");
 
-      const blsChartValue = String(refreshedRowData["BLS Chart"] || "").trim();
+      const blsChartValue = String(refreshedRowData["BLS Chart URL"] || "").trim();
       if (blsChartValue !== "") {
         try {
           const fileId = extractDriveFileId(blsChartValue);
@@ -110,21 +110,23 @@ function createWrapReportsForAllRows() {
           Logger.log("Failed to insert BLS chart for row " + (r + 1) + " (" + reportName + "): " + imageError.message);
         }
       } else {
-        Logger.log("No BLS Chart value for row " + (r + 1) + ": " + reportName);
+        Logger.log("No BLS Chart URL value for row " + (r + 1) + ": " + reportName);
       }
 
-      const salesLiftChartValue = String(refreshedRowData["Sales Lift Chart"] || "").trim();
-      if (salesLiftChartValue !== "") {
+      const salesChartValue = String(refreshedRowData["Sales Chart URL"] || "").trim();
+      if (salesChartValue !== "") {
         try {
-          const fileId = extractDriveFileId(salesLiftChartValue);
+          const fileId = extractDriveFileId(salesChartValue);
           replacePlaceholderWithDriveImage(presentation, SALES_LIFT_PLACEHOLDER, fileId);
-          Logger.log("Inserted Sales Lift chart for row " + (r + 1) + ": " + reportName);
+          Logger.log("Inserted Sales chart for row " + (r + 1) + ": " + reportName);
         } catch (imageError) {
-          Logger.log("Failed to insert Sales Lift chart for row " + (r + 1) + " (" + reportName + "): " + imageError.message);
+          Logger.log("Failed to insert Sales chart for row " + (r + 1) + " (" + reportName + "): " + imageError.message);
         }
       } else {
-        Logger.log("No Sales Lift Chart value for row " + (r + 1) + ": " + reportName);
+        Logger.log("No Sales Chart URL value for row " + (r + 1) + ": " + reportName);
       }
+
+      removeIrrelevantSlidesByMarker(presentation, refreshedRowData);
 
       presentation.saveAndClose();
       Logger.log("Created: " + reportName);
@@ -726,6 +728,150 @@ function isWeakResults(input) {
   return positives === 0;
 }
 
+function removeIrrelevantSlidesByMarker(presentation, rowData) {
+  const slides = presentation.getSlides();
+
+  for (let i = slides.length - 1; i >= 0; i--) {
+    const slide = slides[i];
+    const slideText = getAllSlideText(slide);
+
+    if (shouldRemoveSlideByMarker(slideText, rowData)) {
+      slide.remove();
+      Logger.log("Removed slide " + (i + 1) + " based on marker.");
+    } else {
+      removeSlideMarkers(slide);
+    }
+  }
+}
+
+function shouldRemoveSlideByMarker(slideText, rowData) {
+  const text = String(slideText || "");
+
+  if (text.indexOf("[[REMOVE_IF_NO_BLS]]") !== -1) {
+    const hasBlsData =
+      String(rowData["BLS KPI 1"] || "").trim() !== "" ||
+      String(rowData["BLS KPI 2"] || "").trim() !== "" ||
+      String(rowData["BLS KPI 3"] || "").trim() !== "" ||
+      String(rowData["BLS KPI 4"] || "").trim() !== "" ||
+      String(rowData["BLS KPI 5"] || "").trim() !== "";
+    return !hasBlsData;
+  }
+
+  if (text.indexOf("[[REMOVE_IF_NO_BLS_CHART]]") !== -1) {
+    return String(rowData["BLS Chart URL"] || "").trim() === "";
+  }
+
+  if (text.indexOf("[[REMOVE_IF_NO_SALES]]") !== -1) {
+    const hasSalesData =
+      String(rowData["Sales Lift"] || "").trim() !== "" ||
+      String(rowData["Sales Lift 2"] || "").trim() !== "" ||
+      String(rowData["Sales Lift 3"] || "").trim() !== "" ||
+      String(rowData["Inc Sales"] || "").trim() !== "" ||
+      String(rowData["IROAS"] || "").trim() !== "";
+    return !hasSalesData;
+  }
+
+  if (text.indexOf("[[REMOVE_IF_NO_SALES_CHART]]") !== -1) {
+    return String(rowData["Sales Chart URL"] || "").trim() === "";
+  }
+
+  if (text.indexOf("[[REMOVE_IF_NO_DELIVERY]]") !== -1) {
+    const hasDeliveryData =
+      String(rowData["Spend"] || "").trim() !== "" ||
+      String(rowData["Imps"] || "").trim() !== "" ||
+      String(rowData["Reach"] || "").trim() !== "" ||
+      String(rowData["Video View Completions"] || "").trim() !== "" ||
+      String(rowData["Frequency"] || "").trim() !== "" ||
+      String(rowData["Weekly Frequency"] || "").trim() !== "" ||
+      String(rowData["VVCR"] || "").trim() !== "";
+    return !hasDeliveryData;
+  }
+
+  if (text.indexOf("[[REMOVE_IF_NO_VISITS]]") !== -1) {
+    const hasVisitData =
+      String(rowData["Incremental Visit Lift %"] || "").trim() !== "" ||
+      String(rowData["Incremental Visits"] || "").trim() !== "" ||
+      String(rowData["Total Incremental Visits"] || "").trim() !== "" ||
+      String(rowData["CPIV"] || "").trim() !== "";
+    return !hasVisitData;
+  }
+
+  if (text.indexOf("[[REMOVE_IF_NO_CONVERSION]]") !== -1) {
+    const hasConversionData =
+      String(rowData["CVR Lift"] || "").trim() !== "" ||
+      String(rowData["CVR Lift 2"] || "").trim() !== "" ||
+      String(rowData["CVR Lift 3"] || "").trim() !== "" ||
+      String(rowData["Inc Count"] || "").trim() !== "" ||
+      String(rowData["Inc Count 2"] || "").trim() !== "" ||
+      String(rowData["Inc Count 3"] || "").trim() !== "" ||
+      String(rowData["CPIC"] || "").trim() !== "" ||
+      String(rowData["CPIC 2"] || "").trim() !== "" ||
+      String(rowData["CPIC 3"] || "").trim() !== "";
+    return !hasConversionData;
+  }
+
+  if (text.indexOf("[[REMOVE_IF_NO_RECOMMENDATIONS]]") !== -1) {
+    return String(rowData["Recommendations"] || "").trim() === "";
+  }
+
+  return false;
+}
+
+function getAllSlideText(slide) {
+  const pageElements = slide.getPageElements();
+  let text = "";
+
+  for (let i = 0; i < pageElements.length; i++) {
+    text += extractTextFromElement(pageElements[i]) + "\n";
+  }
+
+  return text;
+}
+
+function extractTextFromElement(element) {
+  const type = element.getPageElementType();
+
+  if (type === SlidesApp.PageElementType.SHAPE) {
+    try {
+      return element.asShape().getText().asString();
+    } catch (e) {
+      return "";
+    }
+  }
+
+  if (type === SlidesApp.PageElementType.GROUP) {
+    try {
+      const children = element.asGroup().getChildren();
+      let text = "";
+      for (let i = 0; i < children.length; i++) {
+        text += extractTextFromElement(children[i]) + "\n";
+      }
+      return text;
+    } catch (e) {
+      return "";
+    }
+  }
+
+  return "";
+}
+
+function removeSlideMarkers(slide) {
+  const markers = [
+    "[[REMOVE_IF_NO_BLS]]",
+    "[[REMOVE_IF_NO_BLS_CHART]]",
+    "[[REMOVE_IF_NO_SALES]]",
+    "[[REMOVE_IF_NO_SALES_CHART]]",
+    "[[REMOVE_IF_NO_DELIVERY]]",
+    "[[REMOVE_IF_NO_VISITS]]",
+    "[[REMOVE_IF_NO_CONVERSION]]",
+    "[[REMOVE_IF_NO_RECOMMENDATIONS]]"
+  ];
+
+  for (let i = 0; i < markers.length; i++) {
+    slide.replaceAllText(markers[i], "");
+  }
+}
+
 function getStrongestBrandMetric(metrics) {
   if (!metrics || metrics.length === 0) return null;
 
@@ -762,15 +908,6 @@ function normalizePluralLabel(label, fallback) {
   const clean = String(label || "").trim();
   if (clean === "") return fallback;
   return clean.toLowerCase();
-}
-
-function compact(values) {
-  const result = [];
-  for (let i = 0; i < values.length; i++) {
-    const v = String(values[i] || "").trim();
-    if (v !== "") result.push(v);
-  }
-  return result;
 }
 
 function countTrue(values) {
