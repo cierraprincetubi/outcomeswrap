@@ -7,7 +7,7 @@ function createWrapReportsForAllRows() {
 
   const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
   const sheet = spreadsheet.getSheets()[0];
-  const folder = DriveApp.getFolderById(OUTPUT_FOLDER_ID);
+  const rootFolder = DriveApp.getFolderById(OUTPUT_FOLDER_ID);
 
   ensureLeadingColumns(sheet, ["Quarter", "Season", "Year"]);
 
@@ -33,17 +33,15 @@ function createWrapReportsForAllRows() {
 
   for (let r = 1; r < data.length; r++) {
     const row = data[r];
-
     if (row.join("").trim() === "") continue;
 
     const rowData = {};
-    headers.forEach((header, i) => {
+    headers.forEach(function(header, i) {
       rowData[header] = row[i];
     });
 
     const campaignName = String(rowData["Campaign Name"] || "").trim();
     const existingDeckUrl = String(rowData["Deck URL"] || "").trim();
-    const reportName = rowData["Report Name"] || ("Wrap Report " + r);
 
     if (campaignName === "") {
       Logger.log("Skipped row " + (r + 1) + ": Campaign Name is blank.");
@@ -51,17 +49,11 @@ function createWrapReportsForAllRows() {
     }
 
     if (existingDeckUrl !== "") {
-      Logger.log("Skipped existing report for row " + (r + 1) + ": " + reportName);
+      Logger.log("Skipped existing report for row " + (r + 1) + ": " + (rowData["Report Name"] || campaignName));
       continue;
     }
 
     try {
-      const copy = DriveApp.getFileById(TEMPLATE_ID).makeCopy(
-        reportName + " - Wrap Report",
-        folder
-      );
-
-      const presentation = SlidesApp.openById(copy.getId());
       const generatedAt = new Date();
 
       sheet.getRange(r + 1, generatedAtColUpdated).setValue(generatedAt);
@@ -76,24 +68,35 @@ function createWrapReportsForAllRows() {
       sheet.getRange(r + 1, seasonCol).setValue(fiscal.season);
       sheet.getRange(r + 1, yearCol).setValue(fiscal.year);
 
-      const deckUrl = presentation.getUrl();
-      sheet.getRange(r + 1, deckUrlColUpdated).setValue(deckUrl);
-
       SpreadsheetApp.flush();
 
       const refreshedHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
       const refreshedRow = sheet.getRange(r + 1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
 
       const refreshedRowData = {};
-      refreshedHeaders.forEach((header, i) => {
+      refreshedHeaders.forEach(function(header, i) {
         refreshedRowData[header] = refreshedRow[i];
       });
+
+      const reportLabel = firstNonEmpty([
+        refreshedRowData["Report Name"],
+        "Wrap Report"
+      ]);
+
+      const yearFolder = getOrCreateSubfolder(rootFolder, String(fiscal.year));
+      const deckName = buildDeckName(fiscal.quarter, fiscal.year, reportLabel);
+
+      const copy = DriveApp.getFileById(TEMPLATE_ID).makeCopy(deckName, yearFolder);
+      const presentation = SlidesApp.openById(copy.getId());
+
+      const deckUrl = presentation.getUrl();
+      sheet.getRange(r + 1, deckUrlColUpdated).setValue(deckUrl);
 
       const narrative = buildNarrative(refreshedRowData);
       refreshedRowData["Insight"] = narrative.summary;
       refreshedRowData["Recommendations"] = narrative.recommendations;
 
-      refreshedHeaders.forEach((header) => {
+      refreshedHeaders.forEach(function(header) {
         presentation.replaceAllText("{{" + header + "}}", refreshedRowData[header] || "");
       });
 
@@ -105,12 +108,12 @@ function createWrapReportsForAllRows() {
         try {
           const fileId = extractDriveFileId(blsChartValue);
           replacePlaceholderWithDriveImage(presentation, BLS_PLACEHOLDER, fileId);
-          Logger.log("Inserted BLS chart for row " + (r + 1) + ": " + reportName);
+          Logger.log("Inserted BLS chart for row " + (r + 1) + ": " + deckName);
         } catch (imageError) {
-          Logger.log("Failed to insert BLS chart for row " + (r + 1) + " (" + reportName + "): " + imageError.message);
+          Logger.log("Failed to insert BLS chart for row " + (r + 1) + " (" + deckName + "): " + imageError.message);
         }
       } else {
-        Logger.log("No BLS Chart URL value for row " + (r + 1) + ": " + reportName);
+        Logger.log("No BLS Chart URL value for row " + (r + 1) + ": " + deckName);
       }
 
       const salesChartValue = String(refreshedRowData["Sales Chart URL"] || "").trim();
@@ -118,22 +121,34 @@ function createWrapReportsForAllRows() {
         try {
           const fileId = extractDriveFileId(salesChartValue);
           replacePlaceholderWithDriveImage(presentation, SALES_LIFT_PLACEHOLDER, fileId);
-          Logger.log("Inserted Sales chart for row " + (r + 1) + ": " + reportName);
+          Logger.log("Inserted Sales chart for row " + (r + 1) + ": " + deckName);
         } catch (imageError) {
-          Logger.log("Failed to insert Sales chart for row " + (r + 1) + " (" + reportName + "): " + imageError.message);
+          Logger.log("Failed to insert Sales chart for row " + (r + 1) + " (" + deckName + "): " + imageError.message);
         }
       } else {
-        Logger.log("No Sales Chart URL value for row " + (r + 1) + ": " + reportName);
+        Logger.log("No Sales Chart URL value for row " + (r + 1) + ": " + deckName);
       }
 
       removeIrrelevantSlidesByMarker(presentation, refreshedRowData);
 
       presentation.saveAndClose();
-      Logger.log("Created: " + reportName);
+      Logger.log("Created: " + deckName);
     } catch (e) {
-      Logger.log("ERROR on row " + (r + 1) + " (" + reportName + "): " + e.message);
+      Logger.log("ERROR on row " + (r + 1) + " (" + (rowData["Report Name"] || campaignName) + "): " + e.message);
     }
   }
+}
+
+function buildDeckName(quarter, year, reportName) {
+  return String(quarter || "").trim() + " " + String(year || "").trim() + " " + String(reportName || "").trim() + " Wrap";
+}
+
+function getOrCreateSubfolder(parentFolder, folderName) {
+  const folders = parentFolder.getFoldersByName(folderName);
+  if (folders.hasNext()) {
+    return folders.next();
+  }
+  return parentFolder.createFolder(folderName);
 }
 
 function replacePlaceholderWithDriveImage(presentation, placeholderText, fileId) {
@@ -202,9 +217,7 @@ function findPlaceholderElement(pageElements, placeholderText) {
 }
 
 function normalizePlaceholder(text) {
-  return String(text || "")
-    .replace(/\s+/g, "")
-    .trim();
+  return String(text || "").replace(/\s+/g, "").trim();
 }
 
 function extractDriveFileId(value) {
@@ -309,6 +322,17 @@ function buildNarrative(rowData) {
   const advertiser = firstNonEmpty([
     rowData["Advertiser"]
   ]);
+
+  const brandLiftPartner = firstNonEmpty([
+    rowData["Msmt Partner 2"],
+    rowData["Msmt Partner 1"],
+    rowData["Msmt Partner 3"],
+    rowData["Msmt Partner 4"]
+  ]).toLowerCase();
+
+  const hasBrandLiftStudy =
+    brandLiftPartner.indexOf("upwave") !== -1 ||
+    brandLiftPartner.indexOf("kantar") !== -1;
 
   const conversion1 = {
     type: firstNonEmpty([rowData["CVR Type"]]),
@@ -418,6 +442,27 @@ function buildNarrative(rowData) {
     iroas: iroas
   });
 
+  const context = {
+    resultsStrength: resultsAreWeak ? "soft" : "strong",
+    hasBrandLiftStudy: hasBrandLiftStudy,
+    frequencyBucket:
+      weeklyFrequencyValue < 0.5
+        ? "low"
+        : weeklyFrequencyValue < 0.8
+        ? "moderate"
+        : weeklyFrequencyValue <= 1.3
+        ? "healthy"
+        : "high",
+    isCrossFunnel: countTrue([hasConversion, hasSales, hasBrand, hasVisit]) >= 2,
+    hasAwareness: topBrand && String(topBrand.kpi || "").toLowerCase().indexOf("awareness") !== -1,
+    hasFavorability: topBrand && (
+      String(topBrand.kpi || "").toLowerCase().indexOf("favorability") !== -1 ||
+      String(topBrand.kpi || "").toLowerCase().indexOf("opinion") !== -1
+    ),
+    hasConversion: hasConversion,
+    hasSales: hasSales
+  };
+
   const topOutcomes = [];
   if (topConversion && topConversion.lift) {
     topOutcomes.push(topConversion.lift + " lift in " + normalizeLabel(topConversion.type, "conversion"));
@@ -482,6 +527,12 @@ function buildNarrative(rowData) {
     if (iroas || (topConversion && topConversion.cpic) || cpiv) {
       recommendationBullets.push(
         "Leverage these efficiency benchmarks to support increased investment with greater confidence and clearer performance expectations."
+      );
+    }
+
+    if (hasBrandLiftStudy) {
+      recommendationBullets.push(
+        "Lean further into high-impact formats on Tubi, such as Takeovers and Wrappers, which are well-positioned to drive strong brand recall and perception shifts."
       );
     }
   } else if (hasConversion) {
@@ -584,6 +635,12 @@ function buildNarrative(rowData) {
     recommendationBullets.push(
       "Where possible, pair future upper-funnel efforts with downstream measurement to further demonstrate how Tubi-driven brand momentum contributes to broader business outcomes."
     );
+
+    if (hasBrandLiftStudy) {
+      recommendationBullets.push(
+        "Increase utilization of high-impact units like Takeovers and Wrappers to maximize brand visibility and amplify brand lift performance."
+      );
+    }
   } else if (hasVisit) {
     summary =
       campaignName +
@@ -635,6 +692,16 @@ function buildNarrative(rowData) {
     );
   }
 
+  const pitchRecos = getTubiPitchRecommendation(context);
+  for (let i = 0; i < pitchRecos.length; i++) {
+    recommendationBullets.push(pitchRecos[i]);
+  }
+
+  const formatRecos = getFormatRecommendationByKpi(context);
+  for (let i = 0; i < formatRecos.length; i++) {
+    recommendationBullets.push(formatRecos[i]);
+  }
+
   const frequencyNarrative = getFrequencyNarrative(weeklyFrequencyValue, resultsAreWeak);
 
   if (frequencyNarrative.summaryNote) {
@@ -647,10 +714,76 @@ function buildNarrative(rowData) {
 
   return {
     summary: summary,
-    recommendations: recommendationBullets.map(function(item) {
+    recommendations: dedupeRecommendations(recommendationBullets).map(function(item) {
       return "• " + item;
     }).join("\n")
   };
+}
+
+function getTubiPitchRecommendation(context) {
+  const recos = [];
+
+  if (context.resultsStrength === "strong") {
+    recos.push(
+      "Scale investment on Tubi to build on strong performance, leveraging its ability to drive measurable outcomes across the funnel, including awareness, conversion, and sales impact."
+    );
+  }
+
+  if (context.hasBrandLiftStudy) {
+    recos.push(
+      "Lean into high-impact formats such as Takeovers, Wrappers, and Tubi Moments, which are designed to maximize attention and drive stronger brand recall and perception shifts."
+    );
+  }
+
+  if (context.frequencyBucket === "low") {
+    recos.push(
+      "Increase weekly frequency to take advantage of Tubi’s low ad load environment, which supports higher attention and message retention without excessive clutter."
+    );
+  }
+
+  if (context.isCrossFunnel) {
+    recos.push(
+      "Expand future campaigns to align upper-funnel storytelling with performance-driving tactics, using Tubi’s full suite of formats to connect awareness to action."
+    );
+  }
+
+  if (context.resultsStrength === "soft") {
+    recos.push(
+      "Refine audience targeting and creative strategy, and consider leveraging more premium and contextually aligned placements to improve engagement and performance."
+    );
+  }
+
+  return recos;
+}
+
+function getFormatRecommendationByKpi(context) {
+  const recommendations = [];
+
+  if (context.hasAwareness) {
+    recommendations.push(
+      "Lean into high-impact formats such as Takeovers and Wrappers to maximize visibility and strengthen awareness outcomes."
+    );
+  }
+
+  if (context.hasFavorability) {
+    recommendations.push(
+      "Use Takeovers and Contextual Moments to deepen relevance and strengthen favorability by pairing brand messaging with high-attention viewing environments."
+    );
+  }
+
+  if (context.hasConversion) {
+    recommendations.push(
+      "Prioritize Premium Video, Connected Commerce, and Carousel units to create a stronger path from exposure to action and improve conversion efficiency."
+    );
+  }
+
+  if (context.hasSales) {
+    recommendations.push(
+      "Use Takeovers, Premium Video, and Carousel formats to combine broad visibility with stronger product consideration and sales-driving momentum."
+    );
+  }
+
+  return recommendations;
 }
 
 function getFrequencyNarrative(weeklyFrequency, resultsAreWeak) {
@@ -957,4 +1090,20 @@ function cleanNumeric(value) {
   if (numeric === "" || isNaN(Number(numeric))) return "";
 
   return Number(numeric).toFixed(1).replace(/\.0$/, "");
+}
+
+function dedupeRecommendations(items) {
+  const seen = {};
+  const result = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const item = String(items[i] || "").trim();
+    if (item === "") continue;
+    if (!seen[item]) {
+      seen[item] = true;
+      result.push(item);
+    }
+  }
+
+  return result;
 }
