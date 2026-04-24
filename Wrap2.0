@@ -1,0 +1,157 @@
+#What the script is doing
+
+This script automates pulling topline measurement results into your master sheet. It works across four tabs:
+	•	Brand Lift Summary
+	•	Conversion Lift Summary
+	•	Sales Lift Summary
+	•	Visitation Summary
+
+For each tab, it:
+	1.	Looks for a row with a raw data link
+	2.	Opens the linked file (or folder)
+	3.	Pulls the topline / overall results
+	4.	Maps those results into the correct columns
+	5.	Stamps the row with a Data Extraction Date
+
+⸻
+
+When the script runs on a row
+
+It only processes rows where:
+	•	A raw link exists
+	•	AND the Data Extraction Date is blank
+
+It skips rows where:
+	•	There’s no link
+	•	OR the row has already been processed (date is filled in)
+
+The Data Extraction Date acts as the “done” flag so nothing gets reprocessed.
+
+⸻
+
+What kinds of links it supports
+
+The script can handle:
+	•	Full Google Drive links
+	•	Raw file IDs
+	•	Folder links
+	•	Folder IDs
+
+If it’s a folder, it tries to pick the most relevant file (based on names like “topline”, “summary”, “final”, etc.).
+
+⸻
+
+General extraction rules
+	•	Only pulls topline / overall results (not detailed cuts)
+	•	Works across Docs, Slides, Sheets, and PDFs (via OCR)
+	•	If something can’t be confidently found → it stays blank
+	•	No guessing or filling in questionable data
+
+⸻
+
+Confidence values
+
+All confidence levels are standardized to one of:
+	•	80%
+	•	90%
+	•	95%
+	•	Not Significant
+	•	Not Available
+
+⸻
+
+Advertiser & measurement partner
+	•	Advertiser
+	•	Use it if it’s explicitly stated
+	•	Otherwise try to infer it from the file name or content
+	•	If unclear, leave blank
+	•	Measurement Partner
+	•	Only populate if clearly identified (e.g., Kantar, Upwave, DISQO)
+	•	Otherwise leave blank
+
+⸻
+
+Tab-specific logic
+
+Brand Lift Summary
+
+Pulls:
+	•	Control Response
+	•	Exposed Response
+
+And fills 5 KPIs:
+	1.	Awareness / Aided Awareness
+	2.	Familiarity
+	3.	Favorability
+	4.	Consideration
+	5.	Intent / Purchase Intent
+
+Each KPI includes:
+	•	Control
+	•	Treated
+	•	Absolute Lift
+	•	Confidence
+
+If needed:
+	•	Control = Treated - Lift
+	•	Treated = Control + Lift
+
+⸻
+
+Conversion Lift Summary
+
+The script doesn’t just grab conversions in order — it ranks them by funnel stage:
+	•	CVR Type → most downstream (Purchase, Sign-Up, Install, etc.)
+	•	CVR Type 2 → mid-funnel (Checkout, Lead, Trial)
+	•	CVR Type 3 → upper funnel (Page View, Initiate Download)
+
+For each:
+	•	Lift
+	•	Confidence
+	•	Incremental Count
+	•	CPIC
+
+⸻
+
+Sales Lift Summary
+
+Maps results into:
+	•	Sales Type → Total / Overall Sales
+	•	Sales Type 2 → Online / eCom / Digital
+	•	Sales Type 3 → In-Store
+
+Pulls:
+	•	Sales Lift
+	•	Confidence (primary only)
+	•	Incremental Sales
+	•	IROAS
+
+⸻
+
+Visitation Summary
+
+Pulls:
+	•	Visit Lift %
+	•	Incremental Visits
+	•	CPIV
+
+Important:
+	•	Ignore anything related to Visit Lift Index
+
+⸻
+
+How the parsing works
+
+The script is designed to handle messy, inconsistent formats. It:
+	•	Looks at nearby text around KPIs
+	•	Handles table-style data (like rows from Sheets)
+	•	Works even when formatting varies across vendors
+
+⸻
+
+Design approach
+	•	Keeps things lightweight and modular
+	•	Uses shared logic across tabs, with specific rules per tab
+	•	Avoids overwriting existing data
+	•	Only processes what’s needed
+---
