@@ -5,20 +5,40 @@
  * - Brand Lift Summary
  * - Conversion Lift Summary
  * - Sales Lift Summary
- * - Visitation Summary
+ * - Visitation Lift Summary
  *
- * Rules:
- * - Only process rows where raw link exists
- * - Skip rows where Data Extraction Date is already filled
- * - Only pull overall / topline results
- * - Leave fields blank if not confidently extractable
- * - Standardize confidence to:
- *   80%, 90%, 95%, Not Significant, Not Available
- * - Ignore Visit Lift Index
+ * Run rules:
+ * - Only process rows where the raw link field is populated
+ * - Skip rows where Data Extraction Date already has a value
+ *
+ * Source support:
+ * - Google Sheets
+ * - Excel (.xlsx / .xls) via Drive conversion
+ * - CSV
+ * - Google Docs
+ * - Google Slides
+ * - PDF (OCR via Drive API)
+ * - File URLs / raw file IDs / folder URLs / raw folder IDs
+ *
+ * Parsing approach:
+ * - Structured extraction first for Sheets / Excel / CSV
+ * - Text parsing is fallback only
+ *
+ * Confidence normalization:
+ * - 80%
+ * - 90%
+ * - 95%
+ * - Not Significant
+ * - Not Available
  *
  * Notes:
- * - Supports file URLs, file IDs, folder URLs, folder IDs
- * - PDFs require Advanced Drive Service enabled
+ * - Advertiser logic has been removed
+ * - Campaign ID is extracted instead
+ * - Campaign ID is always a 5- or 6-digit numeric value
+ * - Visitation ignores Visit Lift Index
+ *
+ * Required:
+ * - Apps Script > Services > Drive API
  *************************************************/
 
 const CONFIG = {
@@ -27,7 +47,7 @@ const CONFIG = {
   DATE_HEADER: 'Data Extraction Date',
   DATE_FORMAT: 'yyyy-MM-dd',
   TIMEZONE: Session.getScriptTimeZone(),
-  DEBUG: false,
+  DEBUG: true,
 
   TABS: [
     {
@@ -46,7 +66,7 @@ const CONFIG = {
       parser: 'salesLift'
     },
     {
-      sheetName: 'Visitation Summary',
+      sheetName: 'Visitation Lift Summary',
       rawHeader: 'Visitation Lift Raw',
       parser: 'visitationLift'
     }
@@ -81,16 +101,15 @@ function processSheet_(tabConfig, activeRowOnly) {
 
   const headers = values[CONFIG.HEADER_ROW - 1];
   const headerMap = buildHeaderMap_(headers);
-
   const rawCol = headerMap[toKey_(tabConfig.rawHeader)];
   const dateCol = headerMap[toKey_(CONFIG.DATE_HEADER)];
 
   if (!rawCol) throw new Error(`Missing raw link column: ${tabConfig.rawHeader}`);
   if (!dateCol) throw new Error(`Missing date column: ${CONFIG.DATE_HEADER}`);
 
-  const rows = activeRowOnly ? [sheet.getActiveRange().getRow()] : getDataRows_(sheet);
+  const rowNums = activeRowOnly ? [sheet.getActiveRange().getRow()] : getDataRows_(sheet);
 
-  rows.forEach(rowNum => {
+  rowNums.forEach(rowNum => {
     if (rowNum <= CONFIG.HEADER_ROW) return;
 
     const row = sheet.getRange(rowNum, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -101,15 +120,17 @@ function processSheet_(tabConfig, activeRowOnly) {
     if (extractionDate) return;
 
     try {
-      const source = readSource_(rawLink);
-      const parsed = parseByType_(tabConfig.parser, source.text, source.fileName);
-      writeParsedResultsToRow_(sheet, rowNum, headerMap, parsed);
+      if (CONFIG.DEBUG) Logger.log(`Processing ${tabConfig.sheetName} row ${rowNum}: ${rawLink}`);
 
+      const source = getSourceData_(rawLink);
+      const parsed = parseByType_(tabConfig.parser, source);
+
+      writeParsedResultsToRow_(sheet, rowNum, headerMap, parsed);
       sheet.getRange(rowNum, dateCol).setValue(
         Utilities.formatDate(new Date(), CONFIG.TIMEZONE, CONFIG.DATE_FORMAT)
       );
     } catch (e) {
-      if (CONFIG.DEBUG) Logger.log(`${tabConfig.sheetName} row ${rowNum} failed: ${e.message}`);
+      Logger.log(`Row ${rowNum} failed: ${e.message}`);
     }
   });
 }
@@ -138,8 +159,8 @@ function getDataRows_(sheet) {
 
 function ensureHeaderExists_(sheet, headerName) {
   const headers = sheet.getRange(CONFIG.HEADER_ROW, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const found = headers.some(h => toKey_(h) === toKey_(headerName));
-  if (!found) {
+  const exists = headers.some(h => toKey_(h) === toKey_(headerName));
+  if (!exists) {
     sheet.getRange(CONFIG.HEADER_ROW, sheet.getLastColumn() + 1).setValue(headerName);
   }
 }
@@ -155,29 +176,70 @@ function writeParsedResultsToRow_(sheet, rowNum, headerMap, parsed) {
  * SOURCE HANDLING
  * ========================================================= */
 
-function readSource_(input) {
-  const id = extractDriveId_(input);
-  if (!id) throw new Error(`Could not parse file/folder ID from: ${input}`);
+function getSourceData_(input) {
+  const id = extractDriveIdDetailed_(input);
+  if (!id) throw new Error(`Could not parse file or folder ID from: ${input}`);
 
   try {
     const file = DriveApp.getFileById(id);
-    return {
-      text: extractTextFromFileById_(file.getId()),
-      fileName: file.getName()
-    };
-  } catch (e) {}
+    return buildSourceFromFile_(file);
+  } catch (fileErr) {
+    if (CONFIG.DEBUG) Logger.log(`Not a direct file or file access failed: ${fileErr.message}`);
+  }
 
-  const folder = DriveApp.getFolderById(id);
-  const best = pickBestFileFromFolder_(folder);
-  if (!best) throw new Error('No supported file found in folder.');
+  try {
+    const folder = DriveApp.getFolderById(id);
+    const bestFile = pickBestFileFromFolder_(folder);
+    if (!bestFile) throw new Error(`No supported file found in folder: ${folder.getName()}`);
+    return buildSourceFromFile_(DriveApp.getFileById(bestFile.id));
+  } catch (folderErr) {
+    throw new Error(`Could not read source: ${folderErr.message}`);
+  }
+}
+
+function buildSourceFromFile_(file) {
+  const fileId = file.getId();
+  const fileName = file.getName();
+  const mime = file.getMimeType();
+
+  if (CONFIG.DEBUG) {
+    Logger.log(`Reading file: ${fileName} | mime=${mime} | id=${fileId}`);
+  }
+
+  if (mime === MimeType.GOOGLE_SHEETS) {
+    return {
+      isStructured: true,
+      fileType: 'google_sheet',
+      fileName: fileName,
+      tables: extractTablesFromGoogleSheet_(fileId),
+      text: ''
+    };
+  }
+
+  if (mime === MimeType.CSV || /\.csv$/i.test(fileName)) {
+    return {
+      isStructured: true,
+      fileType: 'csv',
+      fileName: fileName,
+      tables: extractTablesFromCsv_(file),
+      text: ''
+    };
+  }
+
+  if (isExcelFile_(mime, fileName)) {
+    throw new Error('Excel files are not supported in this version. Please use a Google Sheet or CSV source.');
+  }
 
   return {
-    text: extractTextFromFileById_(best.id),
-    fileName: best.name
+    isStructured: false,
+    fileType: mime,
+    fileName: fileName,
+    tables: [],
+    text: extractTextFromFileById_(fileId)
   };
 }
 
-function extractDriveId_(input) {
+function extractDriveIdDetailed_(input) {
   if (!input) return null;
   const s = String(input).trim();
 
@@ -205,22 +267,26 @@ function pickBestFileFromFolder_(folder) {
   while (files.hasNext()) {
     const file = files.next();
     const mime = file.getMimeType();
+    const name = file.getName().toLowerCase();
 
     if (
+      mime === MimeType.GOOGLE_SHEETS ||
       mime === MimeType.GOOGLE_DOCS ||
       mime === MimeType.GOOGLE_SLIDES ||
-      mime === MimeType.GOOGLE_SHEETS ||
-      mime === MimeType.PDF
+      mime === MimeType.PDF ||
+      mime === MimeType.CSV ||
+      isExcelFile_(mime, file.getName())
     ) {
-      const n = file.getName().toLowerCase();
       let score = 0;
-      if (n.indexOf('topline') >= 0) score += 50;
-      if (n.indexOf('summary') >= 0) score += 40;
-      if (n.indexOf('overall') >= 0) score += 30;
-      if (n.indexOf('final') >= 0) score += 20;
-      if (n.indexOf('raw') >= 0) score += 15;
-      if (n.indexOf('lift') >= 0) score += 10;
-      if (mime === MimeType.GOOGLE_SHEETS) score += 10;
+      if (name.indexOf('topline') >= 0) score += 50;
+      if (name.indexOf('summary') >= 0) score += 40;
+      if (name.indexOf('overall') >= 0) score += 35;
+      if (name.indexOf('raw') >= 0) score += 20;
+      if (name.indexOf('final') >= 0) score += 15;
+      if (name.indexOf('lift') >= 0) score += 10;
+      if (mime === MimeType.GOOGLE_SHEETS) score += 15;
+      if (mime === MimeType.CSV) score += 12;
+      if (isExcelFile_(mime, file.getName())) score += 12;
 
       candidates.push({
         id: file.getId(),
@@ -238,11 +304,148 @@ function pickBestFileFromFolder_(folder) {
     return b.updated.getTime() - a.updated.getTime();
   });
 
+  if (CONFIG.DEBUG) {
+    Logger.log('Folder candidates: ' + candidates.map(c => `${c.name} [${c.score}]`).join(' | '));
+  }
+
   return candidates[0];
 }
 
+function isExcelFile_(mime, fileName) {
+  const name = String(fileName || '').toLowerCase();
+  return mime === MimeType.MICROSOFT_EXCEL ||
+    /application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet/i.test(mime) ||
+    /application\/vnd\.ms-excel/i.test(mime) ||
+    /\.xlsx$/i.test(name) ||
+    /\.xls$/i.test(name);
+}
+
 /* =========================================================
- * FILE EXTRACTION
+ * TABLE EXTRACTION
+ * ========================================================= */
+
+function extractTablesFromGoogleSheet_(fileId) {
+  const ss = SpreadsheetApp.openById(fileId);
+  const tables = [];
+
+  ss.getSheets().forEach(sh => {
+    const values = sh.getDataRange().getDisplayValues();
+    if (!values || !values.length) return;
+
+    const normalized = values.map(r => r.map(c => String(c || '').trim()));
+    const headerInfo = detectHeaderRow_(normalized);
+    if (!headerInfo) return;
+
+    tables.push({
+      sheetName: sh.getName(),
+      headers: headerInfo.headers,
+      rows: normalized.slice(headerInfo.rowIndex + 1).filter(r => r.join('').trim() !== '')
+    });
+  });
+
+  return tables;
+}
+
+function extractTablesFromCsv_(file) {
+  const text = file.getBlob().getDataAsString();
+  const rows = Utilities.parseCsv(text);
+  if (!rows || !rows.length) return [];
+
+  const normalized = rows.map(r => r.map(c => String(c || '').trim()));
+  const headerInfo = detectHeaderRow_(normalized);
+  if (!headerInfo) return [];
+
+  return [{
+    sheetName: file.getName(),
+    headers: headerInfo.headers,
+    rows: normalized.slice(headerInfo.rowIndex + 1).filter(r => r.join('').trim() !== '')
+  }];
+}
+
+function tryExtractTablesFromExcelByConversion_(file) {
+  try {
+    const blob = file.getBlob();
+    const resource = {
+      title: file.getName() + ' TEMP CONVERT',
+      mimeType: MimeType.GOOGLE_SHEETS
+    };
+
+    const converted = Drive.Files.insert(resource, blob, { convert: true });
+    const tables = extractTablesFromGoogleSheet_(converted.id);
+    DriveApp.getFileById(converted.id).setTrashed(true);
+    return tables;
+  } catch (e) {
+    Logger.log('Excel conversion failed: ' + e.message);
+    return [];
+  }
+}
+
+function detectHeaderRow_(rows) {
+  const candidates = [
+    'general report type',
+    'channel',
+    'campaign id',
+    'campaignname',
+    'question',
+    'metric',
+    'kpi',
+    'lift',
+    'confidence',
+    'incremental',
+    'sales',
+    'visits',
+    'control',
+    'exposed'
+  ];
+
+  let bestRow = -1;
+  let bestScore = 0;
+
+  for (let i = 0; i < Math.min(rows.length, 25); i++) {
+    const row = rows[i].map(toKey_);
+    let score = 0;
+
+    row.forEach(cell => {
+      candidates.forEach(token => {
+        if (cell.indexOf(token) >= 0) score++;
+      });
+    });
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestRow = i;
+    }
+  }
+
+  if (bestRow < 0) return null;
+
+  return {
+    rowIndex: bestRow,
+    headers: rows[bestRow]
+  };
+}
+
+function tableToObjects_(table) {
+  const keys = table.headers.map(h => toKey_(h));
+  return table.rows.map(row => {
+    const obj = {};
+    keys.forEach((key, i) => {
+      obj[key] = String(row[i] || '').trim();
+    });
+    return obj;
+  });
+}
+
+function allTableObjects_(tables) {
+  let out = [];
+  tables.forEach(t => {
+    out = out.concat(tableToObjects_(t));
+  });
+  return out;
+}
+
+/* =========================================================
+ * FILE TEXT EXTRACTION
  * ========================================================= */
 
 function extractTextFromFileById_(fileId) {
@@ -258,7 +461,7 @@ function extractTextFromFileById_(fileId) {
   }
 
   if (mime === MimeType.GOOGLE_SHEETS) {
-    return extractTextFromSheets_(fileId);
+    return extractTextFromSheetsAsText_(fileId);
   }
 
   if (mime === MimeType.PDF) {
@@ -298,7 +501,7 @@ function extractTextFromSlides_(fileId) {
   return chunks.join('\n');
 }
 
-function extractTextFromSheets_(fileId) {
+function extractTextFromSheetsAsText_(fileId) {
   const ss = SpreadsheetApp.openById(fileId);
   const chunks = [];
 
@@ -314,10 +517,6 @@ function extractTextFromSheets_(fileId) {
   return chunks.join('\n');
 }
 
-/**
- * Requires Advanced Drive Service enabled:
- * Apps Script -> Services -> Drive API
- */
 function extractTextFromPdfViaOcr_(fileId) {
   const file = DriveApp.getFileById(fileId);
   const blob = file.getBlob();
@@ -339,32 +538,287 @@ function extractTextFromPdfViaOcr_(fileId) {
  * PARSER ROUTER
  * ========================================================= */
 
-function parseByType_(type, text, fileName) {
-  const full = normalizeWhitespace_(text);
+function parseByType_(type, source) {
+  if (source.isStructured) {
+    switch (type) {
+      case 'brandLift':
+        return parseBrandLiftTable_(source.tables, source.fileName);
+      case 'conversionLift':
+        return parseConversionLiftTable_(source.tables, source.fileName);
+      case 'salesLift':
+        return parseSalesLiftTable_(source.tables, source.fileName);
+      case 'visitationLift':
+        return parseVisitationLiftTable_(source.tables, source.fileName);
+      default:
+        return {};
+    }
+  }
+
+  const full = normalizeWhitespace_(source.text || '');
   const clean = isolateToplineSection_(full);
 
   switch (type) {
     case 'brandLift':
-      return parseBrandLift_(clean || full, fileName);
+      return parseBrandLiftText_(clean || full, source.fileName);
     case 'conversionLift':
-      return parseConversionLift_(clean || full, fileName);
+      return parseConversionLiftText_(clean || full, source.fileName);
     case 'salesLift':
-      return parseSalesLift_(clean || full, fileName);
+      return parseSalesLiftText_(clean || full, source.fileName);
     case 'visitationLift':
-      return parseVisitationLift_(clean || full, fileName);
+      return parseVisitationLiftText_(clean || full, source.fileName);
     default:
       return {};
   }
 }
 
 /* =========================================================
- * BRAND LIFT
+ * TABLE PARSERS
  * ========================================================= */
 
-function parseBrandLift_(text, fileName) {
+function parseBrandLiftTable_(tables, fileName) {
+  const rows = allTableObjects_(tables);
+  if (!rows.length) return emptyBrandLiftResult_();
+
+  const working = rows.filter(r =>
+    matchesOverall_(getField_(r, ['cut category'])) &&
+    matchesOverall_(getField_(r, ['cut name']))
+  );
+
+  const baseRows = working.length ? working : rows;
+
   const result = {
-    'Advertiser': inferAdvertiser_(text, fileName),
-    'BLS Msmt Partner': extractMeasurementPartner_(text),
+    'Campaign ID': extractCampaignIdFromRows_(baseRows) || extractCampaignIdFromSourceName_(fileName),
+    'BLS Msmt Partner': extractMeasurementPartnerFromRows_(baseRows, 'brandLift') || extractMeasurementPartnerFromSourceName_(fileName, 'brandLift')
+  };
+
+  result['Control Response'] = '';
+  result['Exposed Response'] = '';
+
+  const kpiMap = [
+    { num: 1, label: 'Awareness', matchers: ['aided awareness', 'awareness'] },
+    { num: 2, label: 'Familiarity', matchers: ['familiarity'] },
+    { num: 3, label: 'Favorability', matchers: ['favorability'] },
+    { num: 4, label: 'Consideration', matchers: ['consideration'] },
+    { num: 5, label: 'Intent', matchers: ['purchase intent', 'intent'], fallbackMatchers: ['purchase propensity'] }
+  ];
+
+  kpiMap.forEach(kpi => {
+    const row = findBestBrandLiftRow_(baseRows, kpi.matchers, kpi.fallbackMatchers || []);
+    const parsed = row ? parseBrandLiftStructuredRow_(row) : blankBrandMetric_();
+
+    result[`BLS KPI ${kpi.num}`] = kpi.label;
+    result[`KPI ${kpi.num} Control`] = parsed.control || '';
+    result[`KPI ${kpi.num} Treated`] = parsed.exposed || '';
+
+    if (kpi.num === 1) {
+      result['KPI 1Abs Lift'] = parsed.lift || '';
+    } else {
+      result[`KPI ${kpi.num} Abs Lift`] = parsed.lift || '';
+    }
+
+    result[`KPI ${kpi.num} Conf`] = parsed.confidence || '';
+  });
+
+  return result;
+}
+
+function findBestBrandLiftRow_(rows, primaryMatchers, fallbackMatchers) {
+  const primary = rows.filter(r => matchesBrandLiftKpi_(r, primaryMatchers));
+  if (primary.length) {
+    primary.sort((a, b) => scoreBrandLiftRow_(b, primaryMatchers) - scoreBrandLiftRow_(a, primaryMatchers));
+    return primary[0];
+  }
+
+  const fallback = rows.filter(r => matchesBrandLiftKpi_(r, fallbackMatchers || []));
+  if (fallback.length) {
+    fallback.sort((a, b) => scoreBrandLiftRow_(b, fallbackMatchers) - scoreBrandLiftRow_(a, fallbackMatchers));
+    return fallback[0];
+  }
+
+  return null;
+}
+
+function matchesBrandLiftKpi_(row, matchers) {
+  const kpiType = String(getField_(row, ['kpi type']) || '').toLowerCase();
+  const question = String(getField_(row, ['question']) || '').toLowerCase();
+
+  for (let i = 0; i < matchers.length; i++) {
+    const m = String(matchers[i]).toLowerCase();
+    if (kpiType.indexOf(m) >= 0) return true;
+    if (question.indexOf(m) >= 0) return true;
+  }
+
+  return false;
+}
+
+function scoreBrandLiftRow_(row, matchers) {
+  let score = 0;
+
+  const cutCategory = String(getField_(row, ['cut category']) || '').toLowerCase();
+  const cutName = String(getField_(row, ['cut name']) || '').toLowerCase();
+  const kpiType = String(getField_(row, ['kpi type']) || '').toLowerCase();
+  const question = String(getField_(row, ['question']) || '').toLowerCase();
+
+  if (matchesOverall_(cutCategory)) score += 25;
+  if (matchesOverall_(cutName)) score += 25;
+
+  for (let i = 0; i < matchers.length; i++) {
+    const m = String(matchers[i]).toLowerCase();
+    if (kpiType.indexOf(m) >= 0) score += 30;
+    if (question.indexOf(m) >= 0) score += 10;
+  }
+
+  if (getField_(row, ['control'])) score += 10;
+  if (getField_(row, ['exposed'])) score += 10;
+  if (getField_(row, ['lift'])) score += 10;
+
+  return score;
+}
+
+function parseBrandLiftStructuredRow_(row) {
+  const control = normalizePercentDecimalAware_(getField_(row, ['control']));
+  const exposed = normalizePercentDecimalAware_(getField_(row, ['exposed']));
+  const lift = normalizePercentOrPointDisplay_(getField_(row, ['lift']));
+  const confidence = normalizeBrandLiftConfidenceFromRow_(row);
+
+  return {
+    control: control || '',
+    exposed: exposed || '',
+    lift: lift || '',
+    confidence: confidence || ''
+  };
+}
+
+function normalizeBrandLiftConfidenceFromRow_(row) {
+  const sig95 = truthyCell_(getField_(row, ['stat sig 0.95']));
+  const sig90 = truthyCell_(getField_(row, ['stat sig 0.9']));
+  const sig80 = truthyCell_(getField_(row, ['stat sig 0.8']));
+
+  if (sig95) return '95%';
+  if (sig90) return '90%';
+  if (sig80) return '80%';
+  return 'Not Significant';
+}
+
+function truthyCell_(value) {
+  const s = String(value || '').trim().toLowerCase();
+  return s === 'true' || s === 'yes' || s === '1';
+}
+
+function parseConversionLiftTable_(tables, fileName) {
+  const rows = allTableObjects_(tables);
+  const filtered = filterOverallRows_(rows);
+  const working = filtered.length ? filtered : rows;
+
+  const result = {
+    'Campaign ID': extractCampaignIdFromRows_(working) || extractCampaignIdFromSourceName_(fileName),
+    'CLS Msmt Partner': extractMeasurementPartnerFromRows_(working, 'conversionLift') || extractMeasurementPartnerFromSourceName_(fileName, 'conversionLift')
+  };
+
+  const parsedEvents = working.map(parseConversionRow_).filter(x => x.name);
+  const events = rankConversionEvents_(parsedEvents);
+
+  if (events[0]) {
+    result['CVR Type'] = events[0].name || '';
+    result['CVR Lift'] = events[0].lift || '';
+    result['CVR Lift Conf'] = normalizeConfidence_(events[0].confidence);
+    result['Inc Count'] = events[0].incCount || '';
+    result['CPIC'] = events[0].cpic || '';
+  }
+
+  if (events[1]) {
+    result['CVR Type 2'] = events[1].name || '';
+    result['CVR Lift 2'] = events[1].lift || '';
+    result['CVR Lift Conf 2'] = normalizeConfidence_(events[1].confidence);
+    result['Inc Count 2'] = events[1].incCount || '';
+    result['CPIC 2'] = events[1].cpic || '';
+  }
+
+  if (events[2]) {
+    result['CVR Type 3'] = events[2].name || '';
+    result['CVR Lift 3'] = events[2].lift || '';
+    result['CVR Lift Conf 3'] = normalizeConfidence_(events[2].confidence);
+    result['Inc Count 3'] = events[2].incCount || '';
+    result['CPIC 3'] = events[2].cpic || '';
+  }
+
+  return dedupeConversionOutputs_(result);
+}
+
+function parseSalesLiftTable_(tables, fileName) {
+  const rows = allTableObjects_(tables);
+  if (!rows.length) return emptySalesLiftResult_();
+
+  const overallOverallRows = rows.filter(r =>
+    matchesOverall_(getField_(r, ['general report type', 'report type'])) &&
+    matchesOverall_(getField_(r, ['channel']))
+  );
+
+  const baseRows = overallOverallRows.length ? overallOverallRows : rows;
+
+  const totalRow = findBestSalesRow_(baseRows, 'total');
+  const onlineRow = findBestSalesRow_(rows, 'online');
+  const storeRow = findBestSalesRow_(rows, 'store');
+
+  return {
+    'Campaign ID': extractCampaignIdFromRows_(baseRows) || extractCampaignIdFromSourceName_(fileName),
+    'Sales Lift Msmt Partner': extractMeasurementPartnerFromRows_(baseRows, 'salesLift') || extractMeasurementPartnerFromSourceName_(fileName, 'salesLift'),
+
+    'Sales Type': totalRow ? 'Total Sales' : '',
+    'Sales Lift': totalRow ? extractSalesLiftFromRow_(totalRow) : '',
+    'Sales Lift Conf': totalRow ? normalizeConfidence_(extractSalesConfidenceFromRow_(totalRow)) : '',
+    'Inc Sales': totalRow ? extractIncrementalSalesFromRow_(totalRow) : '',
+    'IROAS': totalRow ? extractIroasFromRow_(totalRow) : '',
+
+    'Sales Type 2': onlineRow ? 'Online Sales' : '',
+    'Sales Lift 2': onlineRow ? extractSalesLiftFromRow_(onlineRow) : '',
+
+    'Sales Type 3': storeRow ? 'In-Store Sales' : '',
+    'Sales Lift 3': storeRow ? extractSalesLiftFromRow_(storeRow) : ''
+  };
+}
+
+function parseVisitationLiftTable_(tables, fileName) {
+  const rows = allTableObjects_(tables);
+  if (!rows.length) return emptyVisitationResult_();
+
+  const filtered = filterOverallRows_(rows);
+  const working = (filtered.length ? filtered : rows).filter(r => !rowMentionsVisitIndex_(r));
+
+  const partner =
+    extractMeasurementPartnerFromRows_(working, 'visitationLift') ||
+    extractMeasurementPartnerFromSourceName_(fileName, 'visitationLift');
+
+  const incrementalVisits = extractFieldFromBestVisitRows_(working, [
+    'foot traffic - lci exposed - incremental_visits_projected'
+  ], 'raw');
+
+  const visitLift = extractFieldFromBestVisitRows_(working, [
+    'foot traffic - incremental lift - incremental_lift'
+  ], 'percent');
+
+  const visitConfidence = extractFieldFromBestVisitRows_(working, [
+    'foot traffic - incremental lift - lci_confidence_level'
+  ], 'confidence');
+
+  return {
+    'Campaign ID': extractCampaignIdFromRows_(working) || extractCampaignIdFromSourceName_(fileName),
+    'Visit Msmt Partner': partner || '',
+    'Visit Lift %': visitLift || '',
+    'Incremental Visits': incrementalVisits || '',
+    'CPIV': '',
+    'Visit Confidence': normalizeConfidence_(visitConfidence || '')
+  };
+}
+
+/* =========================================================
+ * TEXT PARSERS
+ * ========================================================= */
+
+function parseBrandLiftText_(text, fileName) {
+  const result = {
+    'Campaign ID': extractCampaignIdFromText_(text) || extractCampaignIdFromSourceName_(fileName),
+    'BLS Msmt Partner': extractMeasurementPartnerFromText_(text, 'brandLift') || extractMeasurementPartnerFromSourceName_(fileName, 'brandLift'),
     'Control Response': extractOverallResponse_(text, 'control'),
     'Exposed Response': extractOverallResponse_(text, 'exposed')
   };
@@ -386,11 +840,8 @@ function parseBrandLift_(text, fileName) {
     result[`KPI ${k.num} Control`] = control || '';
     result[`KPI ${k.num} Treated`] = treated || '';
 
-    if (k.num === 1) {
-      result['KPI 1Abs Lift'] = metric.liftDisplay || '';
-    } else {
-      result[`KPI ${k.num} Abs Lift`] = metric.liftDisplay || '';
-    }
+    if (k.num === 1) result['KPI 1Abs Lift'] = metric.liftDisplay || '';
+    else result[`KPI ${k.num} Abs Lift`] = metric.liftDisplay || '';
 
     result[`KPI ${k.num} Conf`] = normalizeConfidence_(metric.confidence);
   });
@@ -398,14 +849,10 @@ function parseBrandLift_(text, fileName) {
   return result;
 }
 
-/* =========================================================
- * CONVERSION LIFT
- * ========================================================= */
-
-function parseConversionLift_(text, fileName) {
+function parseConversionLiftText_(text, fileName) {
   const result = {
-    'Advertiser': inferAdvertiser_(text, fileName),
-    'CLS Msmt Partner': extractMeasurementPartner_(text)
+    'Campaign ID': extractCampaignIdFromText_(text) || extractCampaignIdFromSourceName_(fileName),
+    'CLS Msmt Partner': extractMeasurementPartnerFromText_(text, 'conversionLift') || extractMeasurementPartnerFromSourceName_(fileName, 'conversionLift')
   };
 
   const events = rankConversionEvents_(extractConversionEvents_(text));
@@ -434,93 +881,13 @@ function parseConversionLift_(text, fileName) {
     result['CPIC 3'] = events[2].cpic || '';
   }
 
-  return result;
+  return dedupeConversionOutputs_(result);
 }
 
-function extractConversionEvents_(text) {
-  const lines = text.split('\n').map(x => x.trim()).filter(Boolean);
-  const events = [];
-  const seen = {};
-
-  lines.forEach((line, idx) => {
-    const eventName = detectConversionEventName_(line.toLowerCase());
-    if (!eventName) return;
-
-    const block = collectNearbyLines_(lines, idx, 2).join(' | ');
-    const liftObj = extractLiftValueObject_(block);
-    const conf = extractConfidence_(block);
-    const incCount = extractLabeledNumber_(block, ['incremental conversions', 'inc count', 'incremental count']);
-    const cpic = extractCurrencyLikeValue_(block, ['cpic']);
-
-    const key = eventName.toLowerCase();
-    if (!seen[key]) {
-      seen[key] = true;
-      events.push({
-        name: normalizeConversionLabel_(eventName),
-        lift: liftObj.display || '',
-        confidence: conf || '',
-        incCount: incCount || '',
-        cpic: cpic || ''
-      });
-    }
-  });
-
-  return events;
-}
-
-function rankConversionEvents_(events) {
-  return events
-    .map(e => Object.assign({}, e, { score: conversionPriorityScore_(e.name) }))
-    .sort((a, b) => b.score - a.score);
-}
-
-function conversionPriorityScore_(name) {
-  const n = String(name || '').toLowerCase();
-  if (/(purchase|ticket purchase|sale|order|form completion|enrollment|sign-up|signup|install)/.test(n)) return 300;
-  if (/(checkout|begin checkout|lead|trial|registration|register)/.test(n)) return 200;
-  if (/(page view|landing page view|view content|content view|initiate download|download start)/.test(n)) return 100;
-  return 50;
-}
-
-function detectConversionEventName_(line) {
-  const patterns = [
-    'ticket purchase', 'purchase', 'form completion', 'enrollment', 'sign-up', 'signup', 'install',
-    'begin checkout', 'checkout', 'lead', 'trial', 'registration', 'register',
-    'landing page view', 'page view', 'view content', 'content view', 'initiate download', 'download start'
-  ];
-
-  for (let i = 0; i < patterns.length; i++) {
-    if (line.indexOf(patterns[i]) >= 0) return patterns[i];
-  }
-  return '';
-}
-
-function normalizeConversionLabel_(name) {
-  const n = String(name || '').toLowerCase();
-  if (n === 'ticket purchase') return 'Ticket Purchase';
-  if (n === 'purchase') return 'Purchase';
-  if (n === 'form completion') return 'Form Completion';
-  if (n === 'enrollment') return 'Enrollment';
-  if (n === 'sign-up' || n === 'signup') return 'Sign-Up';
-  if (n === 'install') return 'Install';
-  if (n === 'begin checkout' || n === 'checkout') return 'Checkout';
-  if (n === 'lead') return 'Lead';
-  if (n === 'trial') return 'Trial';
-  if (n === 'registration' || n === 'register') return 'Registration';
-  if (n === 'landing page view' || n === 'page view') return 'Page View';
-  if (n === 'view content' || n === 'content view') return 'Content View';
-  if (n === 'initiate download' || n === 'download start') return 'Initiate Download';
-  return toTitleCase_(name);
-}
-
-/* =========================================================
- * SALES LIFT
- * ========================================================= */
-
-function parseSalesLift_(text, fileName) {
+function parseSalesLiftText_(text, fileName) {
   const result = {
-    'Advertiser': inferAdvertiser_(text, fileName),
-    'Sales Lift Msmt Partner': extractMeasurementPartner_(text)
+    'Campaign ID': extractCampaignIdFromText_(text) || extractCampaignIdFromSourceName_(fileName),
+    'Sales Lift Msmt Partner': extractMeasurementPartnerFromText_(text, 'salesLift') || extractMeasurementPartnerFromSourceName_(fileName, 'salesLift')
   };
 
   const salesEvents = extractSalesEvents_(text);
@@ -549,83 +916,466 @@ function parseSalesLift_(text, fileName) {
   return result;
 }
 
-function extractSalesEvents_(text) {
-  const lines = text.split('\n').map(x => x.trim()).filter(Boolean);
-  const events = [];
-  const seen = {};
+function parseVisitationLiftText_(text, fileName) {
+  const cleanText = removeVisitIndexMentions_(text);
 
-  lines.forEach((line, idx) => {
-    const salesType = detectSalesType_(line.toLowerCase());
-    if (!salesType) return;
+  const liftRaw = extractLabeledNumber_(cleanText, [
+    'foot traffic - incremental lift - incremental_lift'
+  ]);
 
-    const block = collectNearbyLines_(lines, idx, 2).join(' | ');
-    const liftObj = extractLiftValueObject_(block);
-    const conf = extractConfidence_(block);
-    const incSales = extractCurrencyLikeValue_(block, ['incremental sales', 'inc sales']);
-    const iroas = extractLabeledNumber_(block, ['iroas']);
+  const incVisits = extractLabeledNumber_(cleanText, [
+    'foot traffic - lci exposed - incremental_visits_projected'
+  ]);
 
-    const key = salesType.toLowerCase();
-    if (!seen[key]) {
-      seen[key] = true;
-      events.push({
-        name: salesType,
-        lift: liftObj.display || '',
-        confidence: conf || '',
-        incSales: incSales || '',
-        iroas: iroas || ''
+  const confRaw = extractLabeledNumber_(cleanText, [
+    'foot traffic - incremental lift - lci_confidence_level'
+  ]) || extractConfidence_(cleanText);
+
+  return {
+    'Campaign ID': extractCampaignIdFromText_(cleanText) || extractCampaignIdFromSourceName_(fileName),
+    'Visit Msmt Partner': extractMeasurementPartnerFromText_(text, 'visitationLift') || extractMeasurementPartnerFromSourceName_(fileName, 'visitationLift'),
+    'Visit Lift %': normalizePercentDecimalAware_(liftRaw),
+    'Incremental Visits': incVisits || '',
+    'CPIV': '',
+    'Visit Confidence': normalizeConfidence_(confRaw)
+  };
+}
+
+/* =========================================================
+ * CAMPAIGN ID HELPERS
+ * ========================================================= */
+
+function extractCampaignIdFromRows_(rows) {
+  if (!rows || !rows.length) return '';
+
+  const explicitFields = [
+    'campaign id',
+    'campaignid',
+    'general - campaign id',
+    'general-campaign id',
+    'general - campaignid',
+    'general-campaignid',
+    'study id'
+  ];
+
+  for (let i = 0; i < rows.length; i++) {
+    const direct = firstNonBlankField_(rows[i], explicitFields);
+    const normalized = normalizeCampaignId_(direct);
+    if (normalized) return normalized;
+  }
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowText = JSON.stringify(rows[i]);
+    const found = extractCampaignIdFromText_(rowText);
+    if (found) return found;
+  }
+
+  return '';
+}
+
+function extractCampaignIdFromText_(text) {
+  const s = String(text || '');
+  const matches = s.match(/\b\d{5,6}\b/g);
+  if (!matches || !matches.length) return '';
+
+  for (let i = 0; i < matches.length; i++) {
+    const id = normalizeCampaignId_(matches[i]);
+    if (id) return id;
+  }
+
+  return '';
+}
+
+function extractCampaignIdFromSourceName_(fileName) {
+  return extractCampaignIdFromText_(fileName);
+}
+
+function normalizeCampaignId_(value) {
+  const s = String(value || '').trim();
+  if (!/^\d{5,6}$/.test(s)) return '';
+  return s;
+}
+
+/* =========================================================
+ * SALES HELPERS
+ * ========================================================= */
+
+function emptySalesLiftResult_() {
+  return {
+    'Campaign ID': '',
+    'Sales Lift Msmt Partner': '',
+    'Sales Type': '',
+    'Sales Lift': '',
+    'Sales Lift Conf': '',
+    'Inc Sales': '',
+    'IROAS': '',
+    'Sales Type 2': '',
+    'Sales Lift 2': '',
+    'Sales Type 3': '',
+    'Sales Lift 3': ''
+  };
+}
+
+function findBestSalesRow_(rows, bucket) {
+  const candidates = rows.filter(r => matchesSalesBucket_(r, bucket));
+  if (!candidates.length) return null;
+
+  candidates.sort((a, b) => scoreSalesRow_(b, bucket) - scoreSalesRow_(a, bucket));
+  return candidates[0];
+}
+
+function matchesSalesBucket_(row, bucket) {
+  const channel = String(getField_(row, ['channel', 'sales type']) || '').toLowerCase();
+  const reportType = String(getField_(row, ['general report type', 'report type']) || '').toLowerCase();
+
+  if (bucket === 'total') {
+    return matchesOverall_(channel) || matchesOverall_(reportType) || channel === '';
+  }
+  if (bucket === 'online') {
+    return /online|e-?com|ecommerce|digital/.test(channel);
+  }
+  if (bucket === 'store') {
+    return /in-store|instore|store|retail/.test(channel);
+  }
+  return false;
+}
+
+function scoreSalesRow_(row, bucket) {
+  let score = 0;
+
+  const reportType = String(getField_(row, ['general report type', 'report type']) || '').toLowerCase();
+  const channel = String(getField_(row, ['channel', 'sales type']) || '').toLowerCase();
+
+  if (matchesOverall_(reportType)) score += 20;
+  if (bucket === 'total' && matchesOverall_(channel)) score += 20;
+  if (bucket === 'online' && /online|e-?com|ecommerce|digital/.test(channel)) score += 20;
+  if (bucket === 'store' && /in-store|instore|store|retail/.test(channel)) score += 20;
+
+  if (extractSalesLiftFromRow_(row)) score += 30;
+  if (extractIncrementalSalesFromRow_(row)) score += 20;
+  if (extractIroasFromRow_(row)) score += 10;
+
+  return score;
+}
+
+function extractSalesLiftFromRow_(row) {
+  const raw = firstNonBlankField_(row, [
+    'incremental sales lift',
+    'incremental sales lift %'
+  ]);
+  return normalizePercentDecimalAware_(raw);
+}
+
+function extractIncrementalSalesFromRow_(row) {
+  return firstNonBlankField_(row, ['incremental sales']);
+}
+
+function extractSalesConfidenceFromRow_(row) {
+  return firstNonBlankField_(row, [
+    'confidence',
+    'sig',
+    'significance',
+    'confidence level'
+  ]);
+}
+
+function extractIroasFromRow_(row) {
+  return firstNonBlankField_(row, ['iroas']);
+}
+
+/* =========================================================
+ * VISITATION HELPERS
+ * ========================================================= */
+
+function emptyVisitationResult_() {
+  return {
+    'Campaign ID': '',
+    'Visit Msmt Partner': '',
+    'Visit Lift %': '',
+    'Incremental Visits': '',
+    'CPIV': '',
+    'Visit Confidence': ''
+  };
+}
+
+function extractFieldFromBestVisitRows_(rows, aliases, mode) {
+  if (!rows || !rows.length) return '';
+
+  const matches = [];
+
+  rows.forEach(row => {
+    if (rowMentionsVisitIndex_(row)) return;
+
+    const direct = firstNonBlankField_(row, aliases);
+    if (direct) {
+      matches.push({
+        value: direct,
+        score: scoreVisitFieldMatch_(row, aliases, direct)
+      });
+      return;
+    }
+
+    const fuzzy = extractFieldByHeaderSearch_(row, aliases);
+    if (fuzzy) {
+      matches.push({
+        value: fuzzy,
+        score: scoreVisitFieldMatch_(row, aliases, fuzzy) - 5
       });
     }
   });
 
-  return events;
+  if (!matches.length) return '';
+
+  matches.sort((a, b) => b.score - a.score);
+  const value = matches[0].value;
+
+  if (mode === 'percent') return normalizePercentDecimalAware_(value);
+  if (mode === 'confidence') return value;
+  return value;
 }
 
-function detectSalesType_(line) {
-  if (/(total sales|overall sales|sales total|overall)/.test(line)) return 'Total Sales';
-  if (/(online sales|ecom|e-commerce|digital sales|digital)/.test(line)) return 'Online Sales';
-  if (/(in-store|instore|store sales|retail sales)/.test(line)) return 'In-Store Sales';
+function scoreVisitFieldMatch_(row, aliases, value) {
+  let score = 0;
+
+  const reportType = String(getField_(row, ['general report type', 'report type']) || '').toLowerCase();
+  const channel = String(getField_(row, ['channel']) || '').toLowerCase();
+
+  if (matchesOverall_(reportType)) score += 20;
+  if (matchesOverall_(channel)) score += 20;
+  if (value !== '') score += 20;
+
+  const rowText = JSON.stringify(row).toLowerCase();
+  aliases.forEach(a => {
+    if (rowText.indexOf(String(a).toLowerCase()) >= 0) score += 10;
+  });
+
+  if (rowMentionsVisitIndex_(row)) score -= 100;
+
+  return score;
+}
+
+function rowMentionsVisitIndex_(row) {
+  return /visit lift index|visit index/i.test(JSON.stringify(row));
+}
+
+function extractFieldByHeaderSearch_(row, aliases) {
+  const keys = Object.keys(row);
+  for (let i = 0; i < aliases.length; i++) {
+    const alias = toKey_(aliases[i]);
+    for (let j = 0; j < keys.length; j++) {
+      const key = keys[j];
+      if (key.indexOf(alias) >= 0 && row[key] !== '') return row[key];
+    }
+  }
   return '';
 }
 
-function findBestSalesEvent_(events, bucket) {
-  const matchers = {
-    total: /total|overall/,
-    online: /online|e-?commerce|digital/,
-    store: /in-store|instore|store|retail/
-  };
-  return events.find(e => matchers[bucket].test(String(e.name).toLowerCase())) || null;
-}
-
 /* =========================================================
- * VISITATION
+ * TABLE HELPER LOGIC
  * ========================================================= */
 
-function parseVisitationLift_(text, fileName) {
-  const cleanText = removeVisitIndexMentions_(text);
+function filterOverallRows_(rows) {
+  return rows.filter(r => {
+    const grt = getField_(r, ['general report type', 'report type']);
+    const channel = getField_(r, ['channel']);
+    const breakdown = getField_(r, ['breakout', 'breakdown']);
+
+    const grtOk = !grt || matchesOverall_(grt);
+    const channelOk = !channel || matchesOverall_(channel);
+    const breakdownOk = !breakdown || matchesOverall_(breakdown);
+
+    return grtOk && channelOk && breakdownOk;
+  });
+}
+
+function matchesOverall_(value) {
+  const v = String(value || '').toLowerCase().trim();
+  return v === 'overall' || v === 'total' || v === 'all' || v === 'overall results';
+}
+
+function getField_(rowObj, candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const key = toKey_(candidates[i]);
+    if (rowObj.hasOwnProperty(key) && rowObj[key] !== '') return rowObj[key];
+  }
+
+  const keys = Object.keys(rowObj);
+  for (let i = 0; i < candidates.length; i++) {
+    const target = toKey_(candidates[i]);
+    for (let j = 0; j < keys.length; j++) {
+      if (keys[j].indexOf(target) >= 0 && rowObj[keys[j]] !== '') return rowObj[keys[j]];
+    }
+  }
+
+  return '';
+}
+
+function firstNonBlankField_(rowObj, candidates) {
+  return getField_(rowObj, candidates);
+}
+
+function findRowByAliases_(rows, aliases) {
+  for (let i = 0; i < rows.length; i++) {
+    const hay = JSON.stringify(rows[i]).toLowerCase();
+    for (let j = 0; j < aliases.length; j++) {
+      if (hay.indexOf(String(aliases[j]).toLowerCase()) >= 0) return rows[i];
+    }
+  }
+  return null;
+}
+
+function extractOverallControlFromRows_(rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const v = getField_(rows[i], ['control response', 'control', 'control rate', 'control %']);
+    if (v) return normalizePercentDecimalAware_(v);
+  }
+  return '';
+}
+
+function extractOverallExposedFromRows_(rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const v = getField_(rows[i], ['exposed response', 'treated', 'exposed', 'treated rate', 'exposed %']);
+    if (v) return normalizePercentDecimalAware_(v);
+  }
+  return '';
+}
+
+function parseBrandLiftRow_(row) {
+  let control = firstNonBlankField_(row, ['control response', 'control', 'control %', 'control rate']);
+  let treated = firstNonBlankField_(row, ['exposed response', 'treated', 'exposed', 'exposed %', 'treated rate']);
+  let lift = firstNonBlankField_(row, ['abs lift', 'absolute lift', 'lift', 'lift %']);
+  let confidence = firstNonBlankField_(row, ['confidence', 'sig', 'significance', 'confidence level']);
+
+  control = normalizePercentDecimalAware_(control);
+  treated = normalizePercentDecimalAware_(treated);
+  lift = normalizePercentOrPointDisplay_(lift);
+
+  if (!control && treated && parseLiftNumeric_(lift) !== null) {
+    control = inferControl_(treated, parseLiftNumeric_(lift));
+  }
+  if (!treated && control && parseLiftNumeric_(lift) !== null) {
+    treated = inferTreated_(control, parseLiftNumeric_(lift));
+  }
+
+  return { control, treated, lift, confidence };
+}
+
+function blankBrandMetric_() {
+  return { control: '', treated: '', lift: '', confidence: '' };
+}
+
+function parseConversionRow_(row) {
+  const nameRaw = firstNonBlankField_(row, ['conversion type', 'event', 'conversion event', 'metric', 'kpi']);
+  const detected = detectConversionEventName_(String(nameRaw).toLowerCase()) || nameRaw;
 
   return {
-    'Advertiser': inferAdvertiser_(cleanText, fileName),
-    'Visit Msmt Partner': extractMeasurementPartner_(cleanText),
-    'Visit Lift %': extractVisitLift_(cleanText),
-    'Incremental Visits': extractLabeledNumber_(cleanText, ['incremental visits', 'inc visits']),
-    'CPIV': extractCurrencyLikeValue_(cleanText, ['cpiv'])
+    name: normalizeConversionLabel_(detected || ''),
+    lift: normalizePercentOrPointDisplay_(firstNonBlankField_(row, [
+      'cvr lift',
+      'incremental conversion lift %',
+      'incremental conversion lift',
+      'lift',
+      'lift %'
+    ])),
+    confidence: firstNonBlankField_(row, ['confidence', 'sig', 'significance', 'confidence level']),
+    incCount: firstNonBlankField_(row, ['incremental conversions', 'inc count', 'incremental count', 'incremental']),
+    cpic: firstNonBlankField_(row, ['cpic'])
   };
 }
 
-function removeVisitIndexMentions_(text) {
-  return text
-    .split('\n')
-    .filter(line => !/visit lift index|visit index/i.test(line))
-    .join('\n');
+/* =========================================================
+ * MEASUREMENT PARTNER EXTRACTION
+ * ========================================================= */
+
+function extractMeasurementPartnerFromRows_(rows, parserType) {
+  if (!rows || !rows.length) return '';
+
+  const fieldCandidates = [
+    'measurement partner',
+    'msmt partner',
+    'partner',
+    'provider',
+    'vendor',
+    'study provider',
+    'research partner',
+    'data provider'
+  ];
+
+  for (let i = 0; i < rows.length; i++) {
+    const direct = firstNonBlankField_(rows[i], fieldCandidates);
+    const normalized = normalizeMeasurementPartner_(direct, parserType);
+    if (normalized) return normalized;
+  }
+
+  for (let i = 0; i < rows.length; i++) {
+    const normalized = normalizeMeasurementPartner_(JSON.stringify(rows[i]), parserType);
+    if (normalized) return normalized;
+  }
+
+  return '';
 }
 
-function extractVisitLift_(text) {
-  const m = text.match(/(?:visit lift|lift)[^\d+\-]{0,20}([+\-]?\d+(?:\.\d+)?%)/i);
-  return m && m[1] ? normalizePercent_(m[1]) : '';
+function extractMeasurementPartnerFromText_(text, parserType) {
+  return normalizeMeasurementPartner_(text, parserType);
+}
+
+function extractMeasurementPartnerFromSourceName_(fileName, parserType) {
+  return normalizeMeasurementPartner_(fileName, parserType);
+}
+
+function normalizeMeasurementPartner_(value, parserType) {
+  const text = String(value || '').toLowerCase();
+  if (!text) return '';
+
+  const allowed = allowedPartnersByParser_(parserType);
+
+  const checks = [
+    { patterns: ['upwave'], output: 'Upwave' },
+    { patterns: ['kantar'], output: 'Kantar' },
+    { patterns: ['disqo'], output: 'DISQO' },
+    { patterns: ['lucid'], output: 'Lucid' },
+    { patterns: ['dynata'], output: 'Dynata' },
+    { patterns: ['nielsen'], output: 'Nielsen' },
+    { patterns: ['inmarket', 'in market'], output: 'InMarket' },
+    { patterns: ['foursquare'], output: 'Foursquare' },
+    { patterns: ['circana'], output: 'Circana' },
+    { patterns: ['ncsolutions', 'ncs'], output: 'NCS' },
+    { patterns: ['kochava-fandango'], output: 'Kochava-Fandango' },
+    { patterns: ['kochava-shopify'], output: 'Kochava-Shopify' },
+    { patterns: ['kochava-fetch'], output: 'Kochava-Fetch' },
+    { patterns: ['kochava'], output: 'Kochava' }
+  ];
+
+  for (let i = 0; i < checks.length; i++) {
+    const c = checks[i];
+    if (allowed.length && allowed.indexOf(c.output) === -1) continue;
+
+    for (let j = 0; j < c.patterns.length; j++) {
+      if (text.indexOf(c.patterns[j]) >= 0) return c.output;
+    }
+  }
+
+  return '';
+}
+
+function allowedPartnersByParser_(parserType) {
+  if (parserType === 'brandLift') {
+    return ['Upwave', 'Kantar', 'DISQO', 'Lucid', 'Dynata', 'Nielsen'];
+  }
+  if (parserType === 'conversionLift') {
+    return ['Kochava', 'Kochava-Fandango'];
+  }
+  if (parserType === 'salesLift') {
+    return ['InMarket', 'Circana', 'NCS', 'Kochava-Shopify', 'Kochava-Fetch', 'Kochava'];
+  }
+  if (parserType === 'visitationLift') {
+    return ['InMarket', 'Foursquare'];
+  }
+  return [];
 }
 
 /* =========================================================
- * GENERIC METRIC PARSING
+ * TEXT EXTRACTION HELPERS
  * ========================================================= */
 
 function extractMetricForAliases_(text, aliases) {
@@ -680,8 +1430,8 @@ function parseMetricBlock_(chunk) {
   const percents = extractAllPercents_(chunk);
   if (percents.length >= 2) {
     return {
-      control: normalizePercent_(percents[0]),
-      treated: normalizePercent_(percents[1]),
+      control: normalizePercentDecimalAware_(percents[0]),
+      treated: normalizePercentDecimalAware_(percents[1]),
       lift: liftObj.numeric,
       liftDisplay: liftObj.display || '',
       confidence: confidence || '',
@@ -713,8 +1463,8 @@ function parseTableStyleMetric_(blockLines, alias) {
     let liftDisplay = '';
 
     if (percents.length >= 2) {
-      control = normalizePercent_(percents[0]);
-      treated = normalizePercent_(percents[1]);
+      control = normalizePercentDecimalAware_(percents[0]);
+      treated = normalizePercentDecimalAware_(percents[1]);
     }
 
     const explicitLift = extractLiftValueObject_(line);
@@ -752,10 +1502,6 @@ function parseTableStyleMetric_(blockLines, alias) {
   };
 }
 
-/* =========================================================
- * GENERIC EXTRACTION HELPERS
- * ========================================================= */
-
 function extractOverallResponse_(text, audienceType) {
   const labelSet = audienceType === 'control'
     ? ['control response', 'control', 'unexposed']
@@ -764,13 +1510,13 @@ function extractOverallResponse_(text, audienceType) {
   for (let i = 0; i < labelSet.length; i++) {
     const label = labelSet[i];
 
-    let rx = new RegExp(label + '[^\\d]{0,25}(\\d+(?:\\.\\d+)?%)', 'i');
+    let rx = new RegExp(label + '[^\\d]{0,25}(\\d+(?:\\.\\d+)?%?)', 'i');
     let m = text.match(rx);
-    if (m && m[1]) return normalizePercent_(m[1]);
+    if (m && m[1]) return normalizePercentDecimalAware_(m[1]);
 
-    rx = new RegExp('(\\d+(?:\\.\\d+)?%)[^\\w]{0,10}' + label, 'i');
+    rx = new RegExp('(\\d+(?:\\.\\d+)?%?)[^\\w]{0,10}' + label, 'i');
     m = text.match(rx);
-    if (m && m[1]) return normalizePercent_(m[1]);
+    if (m && m[1]) return normalizePercentDecimalAware_(m[1]);
   }
 
   return '';
@@ -780,30 +1526,30 @@ function extractPercentForLabel_(chunk, labelVariants) {
   for (let i = 0; i < labelVariants.length; i++) {
     const label = labelVariants[i];
 
-    let rx = new RegExp(label + '[^\\d]{0,25}([+\\-]?\\d+(?:\\.\\d+)?%)', 'i');
+    let rx = new RegExp(label + '[^\\d]{0,25}([+\\-]?\\d+(?:\\.\\d+)?%?)', 'i');
     let m = chunk.match(rx);
-    if (m && m[1]) return normalizePercent_(m[1]);
+    if (m && m[1]) return normalizePercentDecimalAware_(m[1]);
 
-    rx = new RegExp('([+\\-]?\\d+(?:\\.\\d+)?%)[^\\w]{0,12}' + label, 'i');
+    rx = new RegExp('([+\\-]?\\d+(?:\\.\\d+)?%?)[^\\w]{0,12}' + label, 'i');
     m = chunk.match(rx);
-    if (m && m[1]) return normalizePercent_(m[1]);
+    if (m && m[1]) return normalizePercentDecimalAware_(m[1]);
   }
 
   return '';
 }
 
 function extractAllPercents_(text) {
-  return text.match(/[+\-]?\d+(?:\.\d+)?%/g) || [];
+  return String(text || '').match(/[+\-]?\d+(?:\.\d+)?%/g) || [];
 }
 
 function extractLiftValueObject_(chunk) {
   const patterns = [
-    /(?:abs(?:olute)?\s+lift|visit lift|sales lift|cvr lift|lift|uplift|delta|change)[^\d+\-]{0,20}([+\-]?\d+(?:\.\d+)?)(\s*%|\s*pts?|\s*point(?:s)?)?/i,
+    /(?:incremental sales lift %|incremental sales lift|incremental conversion lift %|incremental conversion lift|abs(?:olute)?\s+lift|visit lift|sales lift|cvr lift|lift|uplift|delta|change)[^\d+\-]{0,20}([+\-]?\d+(?:\.\d+)?)(\s*%|\s*pts?|\s*point(?:s)?)?/i,
     /([+\-]?\d+(?:\.\d+)?)(\s*%|\s*pts?|\s*point(?:s)?)(?:\s*(?:lift|uplift|delta|change))?/i
   ];
 
   for (let i = 0; i < patterns.length; i++) {
-    const m = chunk.match(patterns[i]);
+    const m = String(chunk || '').match(patterns[i]);
     if (m && m[1]) {
       const num = parseFloat(m[1]);
       const unit = normalizeLiftUnit_(m[2] ? String(m[2]).trim() : '%');
@@ -823,75 +1569,19 @@ function extractConfidence_(chunk) {
   if (/not significant|not sig|\bns\b/i.test(chunk)) return 'Not Significant';
   if (/not available|n\/a|na\b/i.test(chunk)) return 'Not Available';
 
-  let m = chunk.match(/\b(80|90|95)\s*%\b/);
+  let m = String(chunk).match(/\b(80|90|95)\s*%\b/);
   if (m && m[1]) return m[1] + '%';
 
-  m = chunk.match(/\b(80|90|95)\s*(?:confidence|conf|significance)\b/i);
+  m = String(chunk).match(/\b(80|90|95)\s*(?:confidence|conf|significance)\b/i);
   if (m && m[1]) return m[1] + '%';
 
   return '';
-}
-
-function extractMeasurementPartner_(text) {
-  const lower = String(text || '').toLowerCase();
-  if (lower.indexOf('upwave') >= 0) return 'Upwave';
-  if (lower.indexOf('kantar') >= 0) return 'Kantar';
-  if (lower.indexOf('disqo') >= 0) return 'DISQO';
-  if (lower.indexOf('lucid') >= 0) return 'Lucid';
-  if (lower.indexOf('dynata') >= 0) return 'Dynata';
-  if (lower.indexOf('nielsen') >= 0) return 'Nielsen';
-  if (lower.indexOf('inmarket') >= 0) return 'InMarket';
-  if (lower.indexOf('foursquare') >= 0) return 'Foursquare';
-  if (lower.indexOf('circana') >= 0) return 'Circana';
-  if (lower.indexOf('ncs') >= 0) return 'NCS';
-  if (lower.indexOf('kochava') >= 0) return 'Kochava';
-  return '';
-}
-
-function inferAdvertiser_(text, fileName) {
-  const full = `${fileName || ''} ${text || ''}`;
-
-  let m = full.match(/advertiser[:\s]+([A-Z][A-Za-z0-9&' .-]{2,50})/i);
-  if (m && m[1]) return cleanEntityName_(m[1]);
-
-  const tokens = String(fileName || '').replace(/\.[^.]+$/, '').split(/[_\-|]/).map(s => s.trim()).filter(Boolean);
-  if (tokens.length) return cleanEntityName_(tokens[0]);
-
-  return '';
-}
-
-function cleanEntityName_(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
-}
-
-function isolateToplineSection_(text) {
-  const markers = [
-    /overall results/i,
-    /topline results/i,
-    /top line results/i,
-    /overall performance/i,
-    /summary results/i,
-    /campaign summary/i,
-    /brand lift summary/i,
-    /conversion lift summary/i,
-    /sales lift summary/i,
-    /visitation summary/i,
-    /overall/i,
-    /topline/i
-  ];
-
-  for (let i = 0; i < markers.length; i++) {
-    const idx = text.search(markers[i]);
-    if (idx >= 0) return text.substring(idx, Math.min(text.length, idx + 7000));
-  }
-
-  return text;
 }
 
 function extractLabeledNumber_(text, labels) {
   for (let i = 0; i < labels.length; i++) {
     const rx = new RegExp(labels[i] + '[^\\d]{0,20}([\\d,]+(?:\\.\\d+)?)', 'i');
-    const m = text.match(rx);
+    const m = String(text || '').match(rx);
     if (m && m[1]) return m[1];
   }
   return '';
@@ -900,10 +1590,160 @@ function extractLabeledNumber_(text, labels) {
 function extractCurrencyLikeValue_(text, labels) {
   for (let i = 0; i < labels.length; i++) {
     const rx = new RegExp(labels[i] + '[^\\d$]{0,20}(\\$?[\\d,]+(?:\\.\\d+)?)', 'i');
-    const m = text.match(rx);
+    const m = String(text || '').match(rx);
     if (m && m[1]) return m[1];
   }
   return '';
+}
+
+/* =========================================================
+ * CONVERSION TEXT HELPERS
+ * ========================================================= */
+
+function extractConversionEvents_(text) {
+  const lines = text.split('\n').map(x => x.trim()).filter(Boolean);
+  const events = [];
+  const seen = {};
+
+  lines.forEach((line, idx) => {
+    const eventName = detectConversionEventName_(line.toLowerCase());
+    if (!eventName) return;
+
+    const block = collectNearbyLines_(lines, idx, 2).join(' | ');
+    const liftObj = extractLiftValueObject_(block);
+    const conf = extractConfidence_(block);
+    const incCount = extractLabeledNumber_(block, ['incremental conversions', 'inc count', 'incremental count']);
+    const cpic = extractCurrencyLikeValue_(block, ['cpic']);
+
+    const key = eventName.toLowerCase();
+    if (!seen[key]) {
+      seen[key] = true;
+      events.push({
+        name: normalizeConversionLabel_(eventName),
+        lift: liftObj.display || '',
+        confidence: conf || '',
+        incCount: incCount || '',
+        cpic: cpic || ''
+      });
+    }
+  });
+
+  return events;
+}
+
+function rankConversionEvents_(events) {
+  return events
+    .filter(e => e && e.name)
+    .map(e => Object.assign({}, e, { score: conversionPriorityScore_(e.name) }))
+    .sort((a, b) => b.score - a.score);
+}
+
+function conversionPriorityScore_(name) {
+  const n = String(name || '').toLowerCase();
+  if (/(purchase|ticket purchase|sale|order|form completion|enrollment|sign-up|signup|install)/.test(n)) return 300;
+  if (/(checkout|begin checkout|lead|trial|registration|register)/.test(n)) return 200;
+  if (/(page view|landing page view|view content|content view|initiate download|download start)/.test(n)) return 100;
+  return 50;
+}
+
+function detectConversionEventName_(line) {
+  const patterns = [
+    'ticket purchase', 'purchase', 'form completion', 'enrollment', 'sign-up', 'signup', 'install',
+    'begin checkout', 'checkout', 'lead', 'trial', 'registration', 'register',
+    'landing page view', 'page view', 'view content', 'content view', 'initiate download', 'download start'
+  ];
+
+  for (let i = 0; i < patterns.length; i++) {
+    if (String(line || '').indexOf(patterns[i]) >= 0) return patterns[i];
+  }
+
+  return '';
+}
+
+function normalizeConversionLabel_(name) {
+  const n = String(name || '').toLowerCase();
+  if (n === 'ticket purchase') return 'Ticket Purchase';
+  if (n === 'purchase') return 'Purchase';
+  if (n === 'form completion') return 'Form Completion';
+  if (n === 'enrollment') return 'Enrollment';
+  if (n === 'sign-up' || n === 'signup') return 'Sign-Up';
+  if (n === 'install') return 'Install';
+  if (n === 'begin checkout' || n === 'checkout') return 'Checkout';
+  if (n === 'lead') return 'Lead';
+  if (n === 'trial') return 'Trial';
+  if (n === 'registration' || n === 'register') return 'Registration';
+  if (n === 'landing page view' || n === 'page view') return 'Page View';
+  if (n === 'view content' || n === 'content view') return 'Content View';
+  if (n === 'initiate download' || n === 'download start') return 'Initiate Download';
+  return toTitleCase_(name);
+}
+
+/* =========================================================
+ * SALES TEXT HELPERS
+ * ========================================================= */
+
+function extractSalesEvents_(text) {
+  const lines = text.split('\n').map(x => x.trim()).filter(Boolean);
+  const events = [];
+  const seen = {};
+
+  lines.forEach((line, idx) => {
+    const salesType = detectSalesType_(line.toLowerCase());
+    if (!salesType) return;
+
+    const block = collectNearbyLines_(lines, idx, 2).join(' | ');
+    const conf = extractConfidence_(block);
+    const incSales = extractCurrencyLikeValue_(block, ['incremental sales']);
+    const iroas = extractLabeledNumber_(block, ['iroas']);
+    const salesLiftRaw = extractLabeledNumber_(block, ['incremental sales lift', 'incremental sales lift %']);
+    const lift = normalizePercentDecimalAware_(salesLiftRaw);
+
+    const key = salesType.toLowerCase();
+    if (!seen[key]) {
+      seen[key] = true;
+      events.push({
+        name: salesType,
+        lift: lift || '',
+        confidence: conf || '',
+        incSales: incSales || '',
+        iroas: iroas || ''
+      });
+    }
+  });
+
+  return events;
+}
+
+function detectSalesType_(line) {
+  if (/(total sales|overall sales|sales total|overall)/.test(line)) return 'Total Sales';
+  if (/(online sales|ecom|e-commerce|digital sales|digital)/.test(line)) return 'Online Sales';
+  if (/(in-store|instore|store sales|retail sales)/.test(line)) return 'In-Store Sales';
+  return '';
+}
+
+function findBestSalesEvent_(events, bucket) {
+  const matchers = {
+    total: /total|overall/,
+    online: /online|e-?commerce|digital/,
+    store: /in-store|instore|store|retail/
+  };
+  return events.find(e => matchers[bucket].test(String(e.name).toLowerCase())) || null;
+}
+
+/* =========================================================
+ * VISITATION TEXT HELPERS
+ * ========================================================= */
+
+function removeVisitIndexMentions_(text) {
+  return text
+    .split('\n')
+    .filter(line => !/visit lift index|visit index/i.test(line))
+    .join('\n');
+}
+
+function extractVisitLift_(text) {
+  const m = String(text || '').match(/(?:visit lift|incremental visit lift %|incremental visit lift|lift)[^\d+\-]{0,20}([+\-]?\d+(?:\.\d+)?%?)/i);
+  return m && m[1] ? normalizePercentDecimalAware_(m[1]) : '';
 }
 
 /* =========================================================
@@ -919,6 +1759,46 @@ function normalizeConfidence_(val) {
   if (s.indexOf('90') >= 0) return '90%';
   if (s.indexOf('80') >= 0) return '80%';
   return '';
+}
+
+function normalizePercentDecimalAware_(value) {
+  if (value === '' || value == null) return '';
+
+  const s = String(value).trim();
+  if (!s) return '';
+
+  if (s.indexOf('%') >= 0) {
+    const numPct = parseFloat(s.replace(/[^0-9.\-]/g, ''));
+    if (isNaN(numPct)) return '';
+    return `${round1_(numPct)}%`;
+  }
+
+  const num = parseFloat(s.replace(/,/g, ''));
+  if (isNaN(num)) return '';
+
+  const pct = Math.abs(num) <= 1 ? num * 100 : num;
+  return `${round1_(pct)}%`;
+}
+
+function normalizePercentOrPointDisplay_(value) {
+  if (!value) return '';
+  const s = String(value).trim();
+
+  if (/pt|point/i.test(s)) {
+    const num = parseLiftNumeric_(s);
+    if (num === null) return '';
+    return formatLiftDisplay_(num, 'pts');
+  }
+
+  return normalizePercentDecimalAware_(s);
+}
+
+function parseLiftNumeric_(value) {
+  if (value == null || value === '') return null;
+  const m = String(value).match(/([+\-]?\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  return isNaN(n) ? null : n;
 }
 
 function inferControl_(treatedDisplay, liftNumeric) {
@@ -955,9 +1835,7 @@ function normalizeWhitespace_(text) {
 }
 
 function normalizePercent_(value) {
-  const num = parsePercentNumber_(value);
-  if (num === null) return '';
-  return formatPercent_(num);
+  return normalizePercentDecimalAware_(value);
 }
 
 function parsePercentNumber_(value) {
