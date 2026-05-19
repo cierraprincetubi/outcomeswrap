@@ -1,193 +1,66 @@
-function generateAndAttachAllCharts() {
-  const SPREADSHEET_ID = "17WN0e84Q6dansBrMu_PE1YhF1wmWobN0oIzb22RSR8s";
-  const SHEET_NAME = ""; // leave blank to use first sheet
-  const SALES_CHART_FOLDER_ID = "1v7RQHU8l3AF1JTQ4J9SIBcn_10N11Yq5";
-  const BLS_CHART_FOLDER_ID = "1lwlkt4vzohLCFsofIsU7kzGI0ZgAmE2q";
+function maybeBuildSalesChartBlob_(rowData, campaignName) {
+  const totalLift = parsePercentNumber_(getFirstValue_(rowData, [
+    "Sales Lift",
+    "Sales Lift %",
+    "Total Sales Lift",
+    "Total Sales Lift %"
+  ]));
 
-  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = SHEET_NAME
-    ? spreadsheet.getSheetByName(SHEET_NAME)
-    : spreadsheet.getSheets()[0];
+  const totalConfRaw = String(getFirstValue_(rowData, [
+    "Sales Lift Conf",
+    "Sales Lift Confidence",
+    "Confidence",
+    "Sig"
+  ]) || "").trim();
 
-  if (!sheet) throw new Error("Sheet not found.");
-
-  const data = sheet.getDataRange().getDisplayValues();
-  if (data.length < 2) {
-    Logger.log("No data rows found.");
-    return;
-  }
-
-  let headers = data[0];
-
-  getRequiredColumnIndex_(headers, "Report Name");
-  const salesChartUrlCol = getOrCreateColumn_(sheet, headers, "Sales Chart URL");
-  const blsChartUrlCol = getOrCreateColumn_(sheet, headers, "BLS Chart URL");
-
-  headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
-  const refreshedData = sheet.getDataRange().getDisplayValues();
-
-  const salesFolder = DriveApp.getFolderById(SALES_CHART_FOLDER_ID);
-  const blsFolder = DriveApp.getFolderById(BLS_CHART_FOLDER_ID);
-
-  for (let r = 1; r < refreshedData.length; r++) {
-    const row = refreshedData[r];
-    const rowData = buildRowObject_(headers, row);
-
-    const reportName = String(rowData["Report Name"] || "").trim();
-    if (!reportName) continue;
-
-    try {
-      const salesBlob = maybeBuildSalesChartBlob_(rowData, reportName);
-      if (salesBlob) {
-        const salesFile = upsertPngFile_(
-          salesFolder,
-          safeFileName_(reportName) + "_sales_chart.png",
-          salesBlob
-        );
-        sheet.getRange(r + 1, salesChartUrlCol).setValue(
-          directViewUrlFromFileId_(salesFile.getId())
-        );
-      }
-
-      const blsBlob = maybeBuildBlsChartBlob_(rowData, reportName);
-      if (blsBlob) {
-        const blsFile = upsertPngFile_(
-          blsFolder,
-          safeFileName_(reportName) + "_bls_chart.png",
-          blsBlob
-        );
-        sheet.getRange(r + 1, blsChartUrlCol).setValue(
-          directViewUrlFromFileId_(blsFile.getId())
-        );
-      }
-
-      Logger.log("Processed row " + (r + 1) + ": " + reportName);
-    } catch (e) {
-      Logger.log("FAILED: " + reportName + " | " + e.message);
-    }
-  }
-
-  SpreadsheetApp.flush();
-  Logger.log("Done generating and attaching charts.");
-}
-
-function maybeBuildSalesChartBlob_(rowData, reportName) {
-  const totalLift = parsePercentNumber_(rowData["Sales Lift"]);
-  const inStoreLift = parsePercentNumber_(rowData["Sales Lift 2"]);
-  const ecommerceLift = parsePercentNumber_(rowData["Sales Lift 3"]);
-  const totalConfRaw = String(rowData["Sales Lift Conf"] || "").trim();
-
-  Logger.log(JSON.stringify({
-    reportName: reportName,
-    salesLift: rowData["Sales Lift"],
-    salesLift2: rowData["Sales Lift 2"],
-    salesLift3: rowData["Sales Lift 3"],
-    salesLiftConf: rowData["Sales Lift Conf"],
-    parsedTotalLift: totalLift,
-    parsedInStoreLift: inStoreLift,
-    parsedEcommerceLift: ecommerceLift
-  }));
-
-  if (totalLift === null && inStoreLift === null && ecommerceLift === null) {
+  if (totalLift === null) {
     return null;
   }
 
-  const labels = [
-    "In-Store Sales Lift",
-    "e-Commerce Sales Lift",
-    "Total Sales Lift"
-  ];
+  const labels = ["Total Sales Lift"];
+  const values = [totalLift];
 
-  const values = [
-    inStoreLift !== null ? inStoreLift : 0,
-    ecommerceLift !== null ? ecommerceLift : 0,
-    totalLift !== null ? totalLift : 0
-  ];
-
-  const bubbleLabels = [
-    inStoreLift !== null ? formatLiftBubbleLabel_(round1_(inStoreLift)) : "0.0",
-    ecommerceLift !== null ? formatLiftBubbleLabel_(round1_(ecommerceLift)) : "0.0",
-    totalLift !== null ? formatLiftBubbleLabel_(round1_(totalLift)) : "0.0"
-  ];
-
-  const bubbleColors = [
-    "#FFFFFF",
-    "#FFFFFF",
-    totalLift !== null ? getLiftBubbleColor_(round1_(totalLift), totalConfRaw) : "#9E9E9E"
-  ];
-
-  const bubbleTextColors = [
-    "#000000",
-    "#000000",
-    "#FFFFFF"
-  ];
+  const bubbleLabel = formatLiftBubbleLabel_(round1_(totalLift));
+  const bubbleColor = getLiftBubbleColor_(round1_(totalLift), totalConfRaw);
 
   const chartConfig = {
     type: "bar",
     data: {
       labels: labels,
-      datasets: [
-        {
-          data: values,
-          backgroundColor: ["#FFDE21", "#FFDE21", "#FFDE21"],
-          borderRadius: 6,
-          borderSkipped: false,
-          barThickness: 64,
-          categoryPercentage: 0.8,
-          barPercentage: 0.9
-        }
-      ]
+      datasets: [{
+        data: values,
+        backgroundColor: ["#FFDE21"],
+        borderRadius: 8,
+        borderSkipped: false,
+        barThickness: 120,
+        categoryPercentage: 0.5,
+        barPercentage: 0.8
+      }]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       layout: {
-        padding: { top: 60, right: 20, bottom: 10, left: 10 }
+        padding: { top: 70, right: 40, bottom: 20, left: 40 }
       },
       plugins: {
         legend: { display: false },
         title: {
           display: true,
-          text: reportName + " Sales Lift",
+          text: campaignName + " Sales Lift",
           color: "#FFFFFF",
-          font: { size: 20, weight: "bold" },
+          font: { size: 28, weight: "bold" },
           padding: { bottom: 20 }
         },
         annotation: {
           annotations: {
-            salesBubble1: {
-              type: "label",
-              xValue: labels[0],
-              yValue: values[0] + 2,
-              backgroundColor: bubbleColors[0],
-              content: [bubbleLabels[0]],
-              color: bubbleTextColors[0],
-              font: { size: 14, weight: "bold" },
-              padding: 6,
-              borderRadius: 999
-            },
-            salesBubble2: {
-              type: "label",
-              xValue: labels[1],
-              yValue: values[1] + 2,
-              backgroundColor: bubbleColors[1],
-              content: [bubbleLabels[1]],
-              color: bubbleTextColors[1],
-              font: { size: 14, weight: "bold" },
-              padding: 6,
-              borderRadius: 999
-            },
-            salesBubble3: {
-              type: "label",
-              xValue: labels[2],
-              yValue: values[2] + 2,
-              backgroundColor: bubbleColors[2],
-              content: [bubbleLabels[2]],
-              color: bubbleTextColors[2],
-              font: { size: 14, weight: "bold" },
-              padding: 6,
-              borderRadius: 999
-            }
+            salesBubble: makeBubble_(
+              labels[0],
+              values[0],
+              bubbleLabel,
+              bubbleColor,
+              "#FFFFFF"
+            )
           }
         }
       },
@@ -195,7 +68,7 @@ function maybeBuildSalesChartBlob_(rowData, reportName) {
         x: {
           ticks: {
             color: "#FFFFFF",
-            font: { size: 11 },
+            font: { size: 22 },
             maxRotation: 0,
             minRotation: 0
           },
@@ -206,7 +79,7 @@ function maybeBuildSalesChartBlob_(rowData, reportName) {
           beginAtZero: true,
           ticks: {
             color: "#FFFFFF",
-            font: { size: 11 },
+            font: { size: 18 },
             callback: function(value) {
               return value + "%";
             }
@@ -223,54 +96,8 @@ function maybeBuildSalesChartBlob_(rowData, reportName) {
 
   return fetchQuickChartPng_(
     chartConfig,
-    safeFileName_(reportName) + "_sales_chart.png",
+    safeFileName_(campaignName) + "_sales_chart.png",
     1000,
     650
   );
 }
-
-function maybeBuildBlsChartBlob_(rowData, reportName) {
-  const labels = [];
-  const controlValues = [];
-  const exposedValues = [];
-  const annotations = {};
-
-  for (let i = 1; i <= 5; i++) {
-    const kpi = String(rowData["BLS KPI " + i] || "").trim();
-    const control = parsePercentNumber_(rowData["KPI " + i + " Control"]);
-    const exposed = parsePercentNumber_(rowData["KPI " + i + " Treated"]);
-    const confRaw = String(rowData["KPI " + i + " Conf"] || "").trim();
-
-    if (!kpi || control === null || exposed === null) continue;
-
-    const lift = round1_(exposed - control);
-    const label = shortenBlsKpiLabel_(kpi);
-    const bubbleColor = getLiftBubbleColor_(lift, confRaw);
-    const sign = lift > 0 ? "+" : "";
-
-    labels.push(label);
-    controlValues.push(control);
-    exposedValues.push(exposed);
-
-    annotations["bubble_" + i] = {
-      type: "label",
-      xValue: label,
-      xAdjust: 20,
-      yValue: exposed + (Math.max(...exposedValues.concat([exposed])) * 0.06),
-      backgroundColor: bubbleColor,
-      content: [sign + lift.toFixed(1)],
-      color: "#FFFFFF",
-      font: {
-        size: 18,
-        weight: "bold"
-      },
-      padding: 10,
-      borderRadius: 999,
-
-      // subtle shadow
-      shadowColor: "rgba(0,0,0,0.25)",
-      shadowBlur: 4,
-      shadowOffsetX: 0,
-      shadowOffsetY: 2
-    };
-  }
